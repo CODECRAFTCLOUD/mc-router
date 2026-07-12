@@ -46,6 +46,7 @@ type Config struct {
 	ApiBinding             string            `usage:"The [host:port] bound for servicing API requests"`
 	CpuProfile             string            `usage:"Enables CPU profiling and writes to given path"`
 	ConnectionRateLimit    int               `default:"1" usage:"Max number of connections to allow per second"`
+	BackendDialTimeout     time.Duration     `default:"500ms" usage:"Timeout for establishing the TCP connection to a backend. On-cluster backends connect in sub-millisecond time, so a short value lets the auto-scale asleep-MOTD/scale-up fallback fire promptly instead of hanging on the OS SYN-retry for a scaled-to-zero service"`
 	InKubeCluster          bool              `usage:"Use in-cluster Kubernetes config"`
 	KubeConfig             string            `usage:"The path to a Kubernetes configuration file"`
 	KubeNamespace          string            `usage:"The namespace to watch or blank for all, which is the default"`

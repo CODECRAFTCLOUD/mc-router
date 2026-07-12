@@ -30,8 +30,10 @@ const (
 	// timeout (~30s) — long enough that a client's server-list ping gives up
 	// before the auto-scale asleep MOTD is served from the dial-failure
 	// fallback below. A healthy backend accepts the TCP connection almost
-	// instantly, so this bound only trips on unreachable/asleep backends.
-	backendDialTimeout = 2 * time.Second
+	// instantly (on-cluster it is sub-millisecond), so this bound only trips on
+	// unreachable/asleep backends. Overridable via --backend-dial-timeout; this
+	// is the default when unset.
+	defaultBackendDialTimeout = 500 * time.Millisecond
 )
 
 var noDeadline time.Time
@@ -90,7 +92,19 @@ func NewConnector(ctx context.Context, routes IRoutes, downScaler IDownScaler, m
 		activeConnections:          NewActiveConnections(),
 		scaleActiveConnections:     NewActiveConnections(),
 		wakingServers:              NewActiveConnections(),
+		backendDialTimeout:         defaultBackendDialTimeout,
 	}
+}
+
+// WithBackendDialTimeout overrides the timeout for establishing the TCP
+// connection to a backend (values <= 0 keep the default). Backends are
+// typically on-cluster with sub-millisecond latency, so a short timeout lets
+// the asleep-MOTD / scale-up fallback fire promptly.
+func (c *Connector) WithBackendDialTimeout(d time.Duration) *Connector {
+	if d > 0 {
+		c.backendDialTimeout = d
+	}
+	return c
 }
 
 type NgrokConnector struct {
@@ -119,6 +133,7 @@ type Connector struct {
 	connectionNotifier         ConnectionNotifier
 	asleepMOTD                 string
 	loadingMOTD                string
+	backendDialTimeout         time.Duration
 }
 
 func (c *Connector) UseConnectionNotifier(notifier ConnectionNotifier) {
@@ -564,7 +579,7 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 		// The kick MUST fire only when the dial genuinely fails (asleep) — gating
 		// on "waker != nil" (true even when the server is awake) would loop-kick a
 		// live server (rejoin → kicked → rejoin …).
-		if probeConn, perr := net.DialTimeout("tcp", backendHostPort, backendDialTimeout); perr == nil {
+		if probeConn, perr := net.DialTimeout("tcp", backendHostPort, c.backendDialTimeout); perr == nil {
 			// Backend already reachable (awake) → fall through to the existing
 			// wake+dial+pump below; a live server is never kicked.
 			_ = probeConn.Close()
@@ -692,7 +707,7 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 		Info("Connecting to backend")
 
 	//goland:noinspection GoResourceLeak ownership transferred to pumpConnections and closed with return statements below
-	backendConn, err := net.DialTimeout("tcp", backendHostPort, backendDialTimeout)
+	backendConn, err := net.DialTimeout("tcp", backendHostPort, c.backendDialTimeout)
 	if err != nil {
 		logrus.
 			WithError(err).
