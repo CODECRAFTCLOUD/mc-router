@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -559,6 +560,32 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 	}()
 
 	if waker != nil && nextState > mcproto.StateStatus {
+		// wake-ux (uniz fork): probe the backend to distinguish awake vs asleep.
+		// The kick MUST fire only when the dial genuinely fails (asleep) — gating
+		// on "waker != nil" (true even when the server is awake) would loop-kick a
+		// live server (rejoin → kicked → rejoin …).
+		if probeConn, perr := net.DialTimeout("tcp", backendHostPort, backendDialTimeout); perr == nil {
+			// Backend already reachable (awake) → fall through to the existing
+			// wake+dial+pump below; a live server is never kicked.
+			_ = probeConn.Close()
+		} else {
+			// Backend unreachable (asleep): gate WAKING on the per-server allowlist,
+			// fire the wake in the BACKGROUND (the k8s waker blocks up to waitTimeout,
+			// so a synchronous call would outlast the client's login timeout), then
+			// kick with a clear message instead of silently holding.
+			if !c.playerAllowedToWake(serverAddress, playerInfo) {
+				_ = mcproto.WriteLoginDisconnect(frontendConn, wakeDenyJSON())
+				return
+			}
+			if scalingTarget != "" {
+				c.downScaler.Cancel(scalingTarget)
+			}
+			logrus.WithField("serverAddress", serverAddress).Info("Waking backend; kicking player to rejoin")
+			go func() { _, _ = waker(c.ctx) }()
+			_ = mcproto.WriteLoginDisconnect(frontendConn, wakeMessageJSON(c.routes.GetWakeMessage(serverAddress)))
+			return
+		}
+
 		serverAllowsPlayer := c.autoScaleUpAllowDenyConfig.ServerAllowsPlayer(serverAddress, playerInfo)
 		logrus.
 			WithField("client", clientAddr).
@@ -856,6 +883,50 @@ func (c *Connector) UseAsleepMOTD(motd string) {
 // UseLoadingMOTD configures a predefined MOTD to serve when backends are waking up
 func (c *Connector) UseLoadingMOTD(motd string) {
 	c.loadingMOTD = motd
+}
+
+// wake-ux (uniz fork) kick messages. The per-server wakeMessage annotation
+// overrides the wake one; the deny message is fixed.
+const (
+	defaultWakeMessage = "🚀 กำลังเปิดเซิร์ฟให้คุณ — join อีกครั้งในอีกสักครู่นะ"
+	wakeDenyMessage    = "คุณไม่มีสิทธิ์ปลุกเซิร์ฟนี้"
+)
+
+// wakeMessageJSON wraps the wake message (or the default) as a chat component.
+func wakeMessageJSON(msg string) string {
+	if msg == "" {
+		msg = defaultWakeMessage
+	}
+	b, _ := json.Marshal(map[string]string{"text": msg})
+	return string(b)
+}
+
+// wakeDenyJSON is the fixed "not allowed to wake" chat component.
+func wakeDenyJSON() string {
+	b, _ := json.Marshal(map[string]string{"text": wakeDenyMessage})
+	return string(b)
+}
+
+// playerAllowedToWake reports whether playerInfo may WAKE serverAddress. A
+// non-empty per-server wake allowlist (from the mc-router.itzg.me/autoScaleUpAllowList
+// annotation) admits only listed usernames; an empty/absent allowlist falls back
+// to the existing file-based allow/deny config (a nil config = allow-all). This
+// gates WAKING (and thus billing) — it must NEVER be used to block a connection
+// to an already-awake server.
+func (c *Connector) playerAllowedToWake(serverAddress string, playerInfo *PlayerInfo) bool {
+	allowlist := c.routes.GetWakeAllowlist(serverAddress)
+	if len(allowlist) > 0 {
+		if playerInfo == nil {
+			return false
+		}
+		for _, name := range allowlist {
+			if name == playerInfo.Name {
+				return true
+			}
+		}
+		return false
+	}
+	return c.autoScaleUpAllowDenyConfig.ServerAllowsPlayer(serverAddress, playerInfo)
 }
 
 func (c *Connector) isWakeInProgress(serverAddress string) bool {
