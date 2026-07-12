@@ -72,6 +72,20 @@ func WriteStatusFromStruct(w io.Writer, status StatusResponse) error {
 	return WriteStatusJSONPacket(w, string(b))
 }
 
+// WriteLoginDisconnect writes a login-state Disconnect (packet 0x00) whose body
+// is a length-prefixed JSON chat component. Lets the router send a client a clear
+// reason before closing during login — e.g. the wake-on-connect "server is
+// starting, rejoin shortly" message — instead of a silent drop or timeout.
+func WriteLoginDisconnect(w io.Writer, jsonMessage string) error {
+	var payload bytes.Buffer
+	if err := WriteString(&payload, jsonMessage); err != nil {
+		return err
+	}
+	pkt := buildPacket(PacketIdLoginDisconnect, payload.Bytes())
+	_, err := w.Write(pkt)
+	return err
+}
+
 // WritePongPacket writes Pong (packet 0x01) with the same payload
 func WritePongPacket(w io.Writer, timestamp int64) error {
 	var pl bytes.Buffer
