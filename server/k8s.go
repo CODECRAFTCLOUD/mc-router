@@ -31,6 +31,9 @@ const (
 	AnnotationAutoScaleAsleepMOTD  = "mc-router.itzg.me/autoScaleAsleepMOTD"
 	AnnotationAutoScaleLoadingMOTD = "mc-router.itzg.me/autoScaleLoadingMOTD"
 	AnnotationAutoScaleWaitTimeout = "mc-router.itzg.me/autoScaleWaitTimeout"
+	// wake-ux (uniz fork): per-server kick-on-wake message + wake allowlist.
+	AnnotationWakeMessage          = "mc-router.itzg.me/wakeMessage"
+	AnnotationAutoScaleUpAllowList = "mc-router.itzg.me/autoScaleUpAllowList"
 )
 
 // K8sWatcher is a RouteFinder that can find routes from kubernetes services.
@@ -190,6 +193,7 @@ func (w *K8sWatcher) handleUpdate(oldObj interface{}, newObj interface{}) {
 		}).Debug("UPDATE")
 		if newRoutableService.externalServiceName != "" {
 			w.routesHandler.CreateMapping(newRoutableService.externalServiceName, newRoutableService.containerEndpoint, newRoutableService.scalingTarget, newRoutableService.autoScaleUp, newRoutableService.autoScaleDown, newRoutableService.autoScaleAsleepMOTD, newRoutableService.autoScaleLoadingMOTD)
+			w.routesHandler.SetWakeConfig(newRoutableService.externalServiceName, newRoutableService.wakeMessage, newRoutableService.wakeAllowlist)
 		} else {
 			w.routesHandler.SetDefaultRoute(newRoutableService.containerEndpoint, newRoutableService.scalingTarget, newRoutableService.autoScaleUp, newRoutableService.autoScaleDown, newRoutableService.autoScaleAsleepMOTD, newRoutableService.autoScaleLoadingMOTD)
 		}
@@ -221,6 +225,7 @@ func (w *K8sWatcher) handleAdd(obj interface{}) {
 
 			if routableService.externalServiceName != "" {
 				w.routesHandler.CreateMapping(routableService.externalServiceName, routableService.containerEndpoint, routableService.scalingTarget, routableService.autoScaleUp, routableService.autoScaleDown, routableService.autoScaleAsleepMOTD, routableService.autoScaleLoadingMOTD)
+				w.routesHandler.SetWakeConfig(routableService.externalServiceName, routableService.wakeMessage, routableService.wakeAllowlist)
 			} else {
 				w.routesHandler.SetDefaultRoute(routableService.containerEndpoint, routableService.scalingTarget, routableService.autoScaleUp, routableService.autoScaleDown, routableService.autoScaleAsleepMOTD, routableService.autoScaleLoadingMOTD)
 			}
@@ -236,6 +241,8 @@ type routableService struct {
 	autoScaleDown        SleeperFunc
 	autoScaleAsleepMOTD  string
 	autoScaleLoadingMOTD string
+	wakeMessage          string
+	wakeAllowlist        []string
 }
 
 // obj is expected to be a *v1.Service
@@ -314,6 +321,19 @@ func (w *K8sWatcher) buildDetails(service *core.Service, externalServiceName str
 		}
 	}
 
+	wakeMessage := ""
+	if v, exists := service.Annotations[AnnotationWakeMessage]; exists && v != "" {
+		wakeMessage = v
+	}
+	var wakeAllowlist []string
+	if v, exists := service.Annotations[AnnotationAutoScaleUpAllowList]; exists && v != "" {
+		for _, name := range strings.Split(v, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				wakeAllowlist = append(wakeAllowlist, name)
+			}
+		}
+	}
+
 	wakerFunc := w.buildScaleFunction(service, 0, 1)
 	rs := &routableService{
 		externalServiceName:  externalServiceName,
@@ -323,6 +343,8 @@ func (w *K8sWatcher) buildDetails(service *core.Service, externalServiceName str
 		autoScaleDown:        w.buildScaleFunction(service, 1, 0),
 		autoScaleAsleepMOTD:  autoScaleAsleepMOTD,
 		autoScaleLoadingMOTD: autoScaleLoadingMOTD,
+		wakeMessage:          wakeMessage,
+		wakeAllowlist:        wakeAllowlist,
 	}
 	return rs
 }

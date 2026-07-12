@@ -38,6 +38,9 @@ type RouteFinder interface {
 type RoutesHandler interface {
 	CreateMapping(serverAddress string, backend string, scalingTarget string, waker WakerFunc, sleeper SleeperFunc, asleepMOTD string, loadingMOTD string)
 	SetDefaultRoute(backend string, scalingTarget string, waker WakerFunc, sleeper SleeperFunc, asleepMOTD string, loadingMOTD string)
+	// SetWakeConfig attaches the per-server wake message + wake allowlist (uniz
+	// fork) to an existing mapping, out of band from CreateMapping.
+	SetWakeConfig(serverAddress string, wakeMessage string, wakeAllowlist []string)
 	// DeleteMapping requests that the serverAddress be removed from routes.
 	// Returns true if the route existed.
 	DeleteMapping(serverAddress string) bool
@@ -70,6 +73,10 @@ type IRoutes interface {
 	GetDefaultRoute() (string, string, WakerFunc, SleeperFunc)
 	GetAsleepMOTD(serverAddress string) string
 	GetLoadingMOTD(serverAddress string) string
+	// GetWakeMessage / GetWakeAllowlist expose the per-server wake-ux config
+	// (uniz fork) to the connector.
+	GetWakeMessage(serverAddress string) string
+	GetWakeAllowlist(serverAddress string) []string
 	SimplifySRV(srvEnabled bool)
 	// BulkRegister registers a set of static mappings, attaching the scaler's waker/sleeper pair. nil-safe: a nil scaler registers without autoscaling.
 	// Reset must be called separately and previous to this if you want to clear existing mappings.
@@ -94,6 +101,11 @@ type mapping struct {
 	asleepMOTD    string
 	loadingMOTD   string
 	scalingTarget string // The endpoint to scale (may differ from backend when using proxy)
+	// wake-ux (uniz fork): per-server kick-on-wake message + the usernames
+	// allowed to wake (and thus bill) the server. Populated by SetWakeConfig
+	// from Service annotations, out of band from CreateMapping.
+	wakeMessage   string
+	wakeAllowlist []string
 }
 
 type routesImpl struct {
@@ -198,6 +210,53 @@ func (r *routesImpl) GetLoadingMOTD(serverAddress string) string {
 		return m.loadingMOTD
 	}
 	return ""
+}
+
+func (r *routesImpl) GetWakeMessage(serverAddress string) string {
+	r.RLock()
+	defer r.RUnlock()
+
+	if serverAddress == "" {
+		return r.defaultRoute.wakeMessage
+	}
+	if m, ok := r.mappings[serverAddress]; ok {
+		return m.wakeMessage
+	}
+	return ""
+}
+
+func (r *routesImpl) GetWakeAllowlist(serverAddress string) []string {
+	r.RLock()
+	defer r.RUnlock()
+
+	if serverAddress == "" {
+		return r.defaultRoute.wakeAllowlist
+	}
+	if m, ok := r.mappings[serverAddress]; ok {
+		return m.wakeAllowlist
+	}
+	return nil
+}
+
+// SetWakeConfig attaches the per-server wake message + wake allowlist (from
+// Service annotations) to an existing mapping. The k8s watcher calls this right
+// after CreateMapping, so these fields ride along WITHOUT threading through
+// CreateMapping's signature (and its many call sites). Empty/nil = defaults
+// (no custom message; empty allowlist = allow-all).
+func (r *routesImpl) SetWakeConfig(serverAddress string, wakeMessage string, wakeAllowlist []string) {
+	r.Lock()
+	defer r.Unlock()
+
+	if serverAddress == "" {
+		r.defaultRoute.wakeMessage = wakeMessage
+		r.defaultRoute.wakeAllowlist = wakeAllowlist
+		return
+	}
+	serverAddress = strings.ToLower(serverAddress)
+	m := r.mappings[serverAddress]
+	m.wakeMessage = wakeMessage
+	m.wakeAllowlist = wakeAllowlist
+	r.mappings[serverAddress] = m
 }
 
 func (r *routesImpl) SimplifySRV(srvEnabled bool) {

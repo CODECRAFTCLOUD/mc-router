@@ -60,6 +60,11 @@ func (m *MockedRoutesHandler) DeleteMapping(serverAddress string) bool {
 	return args.Bool(0)
 }
 
+func (m *MockedRoutesHandler) SetWakeConfig(serverAddress string, wakeMessage string, wakeAllowlist []string) {
+	// no-op: the k8s watcher tests assert routing (CreateMapping/DeleteMapping);
+	// the wake-config roundtrip is covered on the real routesImpl in routes_test.go.
+}
+
 func TestK8sWatcherImpl_handleAddThenUpdate(t *testing.T) {
 	type scenario struct {
 		server  string
