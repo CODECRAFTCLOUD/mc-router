@@ -581,7 +581,17 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 				c.downScaler.Cancel(scalingTarget)
 			}
 			logrus.WithField("serverAddress", serverAddress).Info("Waking backend; kicking player to rejoin")
-			go func() { _, _ = waker(c.ctx) }()
+			// Mark the wake in progress so concurrent status pings serve the
+			// loading MOTD (they check isWakeInProgress). Decrement when the
+			// background waker returns (on reachability or waitTimeout). The
+			// waker decrements ~as the backend becomes reachable, i.e. exactly
+			// when an awake rejoin can proceed, so any hold this causes for a
+			// concurrent awake login is sub-second.
+			c.wakingServers.Increment(serverAddress)
+			go func() {
+				defer c.wakingServers.Decrement(serverAddress)
+				_, _ = waker(c.ctx)
+			}()
 			_ = mcproto.WriteLoginDisconnect(frontendConn, wakeMessageJSON(c.routes.GetWakeMessage(serverAddress)))
 			return
 		}
