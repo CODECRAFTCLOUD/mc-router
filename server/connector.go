@@ -30,10 +30,11 @@ const (
 	// timeout (~30s) — long enough that a client's server-list ping gives up
 	// before the auto-scale asleep MOTD is served from the dial-failure
 	// fallback below. A healthy backend accepts the TCP connection almost
-	// instantly (on-cluster it is sub-millisecond), so this bound only trips on
-	// unreachable/asleep backends. Overridable via --backend-dial-timeout; this
-	// is the default when unset.
-	defaultBackendDialTimeout = 500 * time.Millisecond
+	// instantly, so this bound only trips on unreachable/asleep backends.
+	// Overridable via --backend-dial-timeout: operators whose backends are
+	// reachable faster (e.g. on-cluster Services) can lower it so the asleep
+	// MOTD / scale-up fallback fires sooner.
+	defaultBackendDialTimeout = 2 * time.Second
 )
 
 var noDeadline time.Time
@@ -96,15 +97,15 @@ func NewConnector(ctx context.Context, routes IRoutes, downScaler IDownScaler, m
 	}
 }
 
-// WithBackendDialTimeout overrides the timeout for establishing the TCP
-// connection to a backend (values <= 0 keep the default). Backends are
-// typically on-cluster with sub-millisecond latency, so a short timeout lets
-// the asleep-MOTD / scale-up fallback fire promptly.
-func (c *Connector) WithBackendDialTimeout(d time.Duration) *Connector {
+// UseBackendDialTimeout overrides the timeout for establishing the TCP
+// connection to a backend (values <= 0 keep the default). Backends that are
+// reachable quickly — e.g. on-cluster Services — can use a shorter timeout so
+// the asleep-MOTD / scale-up fallback fires promptly on a scaled-to-zero
+// backend instead of waiting the full default.
+func (c *Connector) UseBackendDialTimeout(d time.Duration) {
 	if d > 0 {
 		c.backendDialTimeout = d
 	}
-	return c
 }
 
 type NgrokConnector struct {

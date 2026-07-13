@@ -102,9 +102,9 @@ func NewServer(ctx context.Context, config *Config) (*Server, error) {
 		config.ConnectionRateLimit = 1
 	}
 
-	connector := NewConnector(ctx, routes, downscaler, metricsBuilder.BuildConnectorMetrics(), config.UseProxyProtocol, config.RecordLogins, autoScaleAllowDenyConfig).
-		WithBackendDialTimeout(config.BackendDialTimeout)
+	connector := NewConnector(ctx, routes, downscaler, metricsBuilder.BuildConnectorMetrics(), config.UseProxyProtocol, config.RecordLogins, autoScaleAllowDenyConfig)
 
+	connector.UseBackendDialTimeout(config.BackendDialTimeout)
 	connector.UseAsleepMOTD(config.AutoScale.AsleepMOTD)
 	connector.UseLoadingMOTD(config.AutoScale.LoadingMOTD)
 
@@ -251,9 +251,9 @@ func (s *Server) Run() {
 			}
 
 		case <-s.ctx.Done():
-			logrus.Info("Server Stopping. Waiting for connections to complete...")
+			logrus.Info("Router server stopping. Waiting for connections to complete...")
 			s.connector.WaitForConnections()
-			logrus.Info("Stopped")
+			logrus.Info("Router server stopped")
 			return
 		}
 	}
