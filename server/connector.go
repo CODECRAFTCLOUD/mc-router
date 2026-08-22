@@ -658,7 +658,11 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 				_ = mcproto.WriteLoginDisconnect(frontendConn, wakeDenyJSON())
 				return
 			}
-			if scalingTarget != nil {
+			// The down-scaler is nil whenever --auto-scale-down is off (our prod
+			// case: the API owns idle-sleep), so guard it like every other call
+			// site does — an unguarded Cancel here panicked the whole router on
+			// every wake login.
+			if c.downScaler != nil && scalingTarget != nil {
 				c.downScaler.Cancel(scalingTarget)
 			}
 			logrus.WithField("serverAddress", serverAddress).Info("Waking backend; kicking player to rejoin")
