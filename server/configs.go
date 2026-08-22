@@ -45,7 +45,8 @@ type Config struct {
 	Mapping                map[string]string `usage:"Comma or newline delimited or repeated mappings of externalHostname=host:port"`
 	ApiBinding             string            `usage:"The [host:port] bound for servicing API requests"`
 	CpuProfile             string            `usage:"Enables CPU profiling and writes to given path"`
-	ConnectionRateLimit    int               `default:"1" usage:"Max number of connections to allow per second"`
+	ConnectionRateLimit    int               `default:"200" usage:"Max number of new connections to accept per second across all clients: 0 to disable"`
+	ConnRateLimitPerIP     int               `default:"5" usage:"Max number of new connections to accept per second from a single public source IP (bursts to 4x): 0 to disable"`
 	BackendDialTimeout     time.Duration     `default:"2s" usage:"Timeout for establishing the TCP connection to a backend. Bounds how long a dial to a scaled-to-zero server's Service (no endpoints) waits before the auto-scale asleep MOTD / scale-up fallback is served; operators with fast on-cluster backends can lower it so that fallback fires sooner"`
 	InKubeCluster          bool              `usage:"Use in-cluster Kubernetes config"`
 	KubeConfig             string            `usage:"The path to a Kubernetes configuration file"`

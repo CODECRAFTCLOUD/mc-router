@@ -7,6 +7,12 @@ on:
       - labeled
       - unlabeled
       - closed
+  pull_request_target:
+    types:
+      - closed
+  release:
+    types:
+      - released
 
 jobs:
   notify:
