@@ -16,7 +16,7 @@ import (
 
 func TestRoutesWakeConfig(t *testing.T) {
 	r := NewRoutes(t.Context())
-	r.CreateMapping("a.com", "backend:25565", "", nil, nil, "", "")
+	r.CreateMapping("a.com", "backend:25565", nil, nil, nil, "", "")
 	r.SetWakeConfig("a.com", "wake up!", []string{"steve", "alex"})
 
 	assert.Equal(t, "wake up!", r.GetWakeMessage("a.com"))
@@ -27,7 +27,7 @@ func TestRoutesWakeConfig(t *testing.T) {
 	assert.Nil(t, r.GetWakeAllowlist("other.com"))
 
 	// Default route (serverAddress == "").
-	r.SetDefaultRoute("d:25565", "", nil, nil, "", "")
+	r.SetDefaultRoute("d:25565", nil, nil, nil, "", "")
 	r.SetWakeConfig("", "default wake", nil)
 	assert.Equal(t, "default wake", r.GetWakeMessage(""))
 }
@@ -60,7 +60,7 @@ func TestFindAndConnectBackendWakeKick(t *testing.T) {
 	drive := func(c *Connector, playerName string) net.Conn {
 		frontend, tr := net.Pipe()
 		go c.findAndConnectBackend(frontend, &net.TCPAddr{IP: net.IPv4(1, 2, 3, 4)},
-			bytes.NewReader(nil), "mc.example.com", &PlayerInfo{Name: playerName},
+			bytes.NewReader(nil), 0, "mc.example.com", &PlayerInfo{Name: playerName},
 			mcproto.StateLogin, false, 758)
 		return tr
 	}
@@ -71,7 +71,7 @@ func TestFindAndConnectBackendWakeKick(t *testing.T) {
 		woke := make(chan struct{}, 1)
 		waker := func(ctx context.Context) (string, error) { woke <- struct{}{}; return "", nil }
 		// 127.0.0.1:1 refuses instantly → probe fails → treated as asleep.
-		routes.CreateMapping("mc.example.com", "127.0.0.1:1", "", waker, nil, "", "")
+		routes.CreateMapping("mc.example.com", "127.0.0.1:1", nil, waker, nil, "", "")
 
 		tr := drive(newConn(routes), "steve")
 		defer tr.Close()
@@ -92,7 +92,7 @@ func TestFindAndConnectBackendWakeKick(t *testing.T) {
 		routes.WithDownScaler(NewDownScaler(false, 5*time.Second))
 		woke := make(chan struct{}, 1)
 		waker := func(ctx context.Context) (string, error) { woke <- struct{}{}; return "", nil }
-		routes.CreateMapping("mc.example.com", "127.0.0.1:1", "", waker, nil, "", "")
+		routes.CreateMapping("mc.example.com", "127.0.0.1:1", nil, waker, nil, "", "")
 		routes.SetWakeConfig("mc.example.com", "", []string{"alice"}) // steve excluded
 
 		tr := drive(newConn(routes), "steve")
@@ -128,7 +128,7 @@ func TestFindAndConnectBackendWakeKick(t *testing.T) {
 		routes := NewRoutes(t.Context())
 		routes.WithDownScaler(NewDownScaler(false, 5*time.Second))
 		waker := func(ctx context.Context) (string, error) { return backendLn.Addr().String(), nil }
-		routes.CreateMapping("mc.example.com", backendLn.Addr().String(), "", waker, nil, "", "")
+		routes.CreateMapping("mc.example.com", backendLn.Addr().String(), nil, waker, nil, "", "")
 
 		tr := drive(newConn(routes), "steve")
 		defer tr.Close()

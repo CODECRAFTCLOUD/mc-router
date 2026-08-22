@@ -53,12 +53,15 @@ func NewServer(ctx context.Context, config *Config) (*Server, error) {
 	routes := NewRoutes(ctx)
 
 	webhookScalerConfigured := config.AutoScale.Webhook.Url != ""
-	downScalerEnabled := (config.AutoScale.Down && (config.InKubeCluster || config.KubeConfig != "" || config.InDocker)) || webhookScalerConfigured
+	downScalerEnabled := (config.AutoScale.Down && (config.InKubeCluster || config.KubeConfig != "" || config.InDocker || config.InDockerSwarm)) || webhookScalerConfigured
 	downScalerDelay := config.AutoScale.DownAfter
-	// Only one instance should be created
-	// TODO why create it if not enabled? nil checks needed if optional
-	downscaler := NewDownScaler(downScalerEnabled, downScalerDelay)
-	routes.WithDownScaler(downscaler)
+	var downscaler IDownScaler
+	if downScalerEnabled {
+		downscaler = NewDownScaler(downScalerEnabled, downScalerDelay)
+		routes.WithDownScaler(downscaler)
+
+		downscaler.HandleContextDone(ctx)
+	}
 
 	// Build the webhook scaler and hand it to the objects that register static
 	// routes so they pick up its waker/sleeper. Discovery-based routes
@@ -94,8 +97,8 @@ func NewServer(ctx context.Context, config *Config) (*Server, error) {
 
 	routes.BulkRegister(webhookScaler, config.Mapping)
 	if config.Default != "" {
-		waker, sleeper := webhookScaler.routeFuncs("", config.Default)
-		routes.SetDefaultRoute(config.Default, "", waker, sleeper, "", "")
+		waker, sleeper, scalingTarget := webhookScaler.routeFuncs("", config.Default)
+		routes.SetDefaultRoute(config.Default, scalingTarget, waker, sleeper, "", "")
 	}
 
 	if config.ConnectionRateLimit < 1 {
@@ -141,7 +144,10 @@ func NewServer(ctx context.Context, config *Config) (*Server, error) {
 	}
 
 	if config.ApiBinding != "" {
-		StartApiServer(config.ApiBinding, routes, routesConfigLoader, webhookScaler)
+		_, err := StartApiServer(ctx, config.ApiBinding, routes, routesConfigLoader, webhookScaler)
+		if err != nil {
+			return nil, fmt.Errorf("could not start API server: %w", err)
+		}
 	}
 
 	routeWatchers := make([]RouteFinder, 0)
@@ -227,6 +233,10 @@ func (s *Server) AcceptConnection(conn net.Conn) {
 		WithField("remoteAddr", conn.RemoteAddr()).
 		Debug("Accepting connection from external source")
 	s.connector.AcceptConnection(conn)
+}
+
+func (s *Server) WithRoutesListener(listener RoutesListener) {
+	s.routes.WithListener(listener)
 }
 
 // Run will run the server until the context is done or a fatal error occurs, so this should be
