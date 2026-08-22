@@ -20,7 +20,6 @@ import (
 	"golang.ngrok.com/ngrok/config"
 
 	"github.com/itzg/mc-router/mcproto"
-	"github.com/juju/ratelimit"
 	"github.com/pires/go-proxyproto"
 	"github.com/sirupsen/logrus"
 )
@@ -146,6 +145,7 @@ type Connector struct {
 	asleepMOTD                 string
 	loadingMOTD                string
 	backendDialTimeout         time.Duration
+	connRateLimiter            *connRateLimiter
 }
 
 func (c *Connector) UseConnectionNotifier(notifier ConnectionNotifier) {
@@ -156,13 +156,19 @@ func (c *Connector) UseClientFilter(filter *ClientFilter) {
 	c.clientFilter = filter
 }
 
-func (c *Connector) StartAcceptingConnections(listenAddress string, connRateLimit int, metricsPeriod time.Duration) error {
+func (c *Connector) StartAcceptingConnections(listenAddress string, connRateLimit, connRateLimitPerIP int, metricsPeriod time.Duration) error {
 	ln, err := c.createListener(listenAddress)
 	if err != nil {
 		return err
 	}
 
-	go c.acceptConnections(ln, connRateLimit, metricsPeriod)
+	c.connRateLimiter = newConnRateLimiter(connRateLimit, connRateLimitPerIP)
+	logrus.
+		WithField("perSecond", connRateLimit).
+		WithField("perSecondPerIP", connRateLimitPerIP).
+		Info("Limiting new connections")
+
+	go c.acceptConnections(ln, metricsPeriod)
 
 	return nil
 }
@@ -241,37 +247,46 @@ func (c *Connector) WaitForConnections() {
 }
 
 // AcceptConnection provides a way to externally supply a connection to consume.
-// Note that this will skip rate limiting.
 func (c *Connector) AcceptConnection(conn net.Conn) {
 	go c.HandleConnection(conn)
 }
 
-func (c *Connector) acceptConnections(ln net.Listener, connRateLimit int, metricsPeriod time.Duration) {
+func (c *Connector) acceptConnections(ln net.Listener, metricsPeriod time.Duration) {
 	//noinspection GoUnhandledErrorResult
 	defer ln.Close()
 
-	bucket := ratelimit.NewBucketWithRate(float64(connRateLimit), int64(connRateLimit*2))
 	if metricsPeriod > 0 {
-		go c.bucketMetrics(bucket, metricsPeriod)
+		go c.rateLimitMetrics(metricsPeriod)
 	}
 
+	// The accept loop is never throttled — see connRateLimiter. Draining the
+	// kernel's accept queue promptly is what keeps a flood from queueing ahead
+	// of legitimate joins; over-limit connections are dropped in
+	// HandleConnection once the source is known.
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
-
-		case <-time.After(bucket.Take(1)):
-			conn, err := ln.Accept()
-			if err != nil {
-				logrus.WithError(err).Error("Failed to accept connection")
-			} else {
-				go c.HandleConnection(conn)
-			}
+		default:
 		}
+
+		conn, err := ln.Accept()
+		if err != nil {
+			if c.ctx.Err() != nil {
+				return
+			}
+			logrus.WithError(err).Error("Failed to accept connection")
+			// A persistent accept error (fd exhaustion, listener wedged) would
+			// otherwise spin this loop at full CPU.
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+
+		go c.HandleConnection(conn)
 	}
 }
 
-func (c *Connector) bucketMetrics(bucket *ratelimit.Bucket, period time.Duration) {
+func (c *Connector) rateLimitMetrics(period time.Duration) {
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
 	for {
@@ -279,7 +294,9 @@ func (c *Connector) bucketMetrics(bucket *ratelimit.Bucket, period time.Duration
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			c.metrics.RateLimitAvailable.Set(float64(bucket.Available()))
+			if c.connRateLimiter != nil && c.connRateLimiter.global != nil {
+				c.metrics.RateLimitAvailable.Set(c.connRateLimiter.global.Tokens())
+			}
 		}
 	}
 }
@@ -296,6 +313,20 @@ func (c *Connector) HandleConnection(frontendConn net.Conn) {
 			allow := c.clientFilter.Allow(tcpAddr.AddrPort())
 			if !allow {
 				logrus.WithField("client", clientAddr).Debug("Client is blocked")
+				return
+			}
+		}
+
+		if c.connRateLimiter != nil {
+			allow, scope, logIt := c.connRateLimiter.allow(tcpAddr.AddrPort().Addr(), time.Now())
+			if !allow {
+				c.metrics.Errors.With("type", "rate_limited").Add(1)
+				if logIt {
+					logrus.
+						WithField("client", clientAddr).
+						WithField("scope", scope).
+						Warn("Connection rate limit exceeded, dropping connection")
+				}
 				return
 			}
 		}

@@ -53,7 +53,7 @@ func TestRouteConfigReloadDoesNotScaleDownActiveConnection(t *testing.T) {
 	frontendListener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = frontendListener.Close() })
-	go connector.acceptConnections(frontendListener, 100, 0)
+	go connector.acceptConnections(frontendListener, 0)
 
 	clientConnection, err := net.Dial("tcp", frontendListener.Addr().String())
 	require.NoError(t, err)

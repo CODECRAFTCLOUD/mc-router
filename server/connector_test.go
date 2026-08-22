@@ -153,7 +153,7 @@ func TestConnectorMOTDFallback(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close()
 
-	go c.acceptConnections(ln, 100, 0)
+	go c.acceptConnections(ln, 0)
 
 	clientConn, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)
@@ -201,7 +201,7 @@ func TestConnectorNonUTF8Handshake(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close()
 
-	go c.acceptConnections(ln, 100, 0)
+	go c.acceptConnections(ln, 0)
 
 	clientConn, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)

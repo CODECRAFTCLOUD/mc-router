@@ -101,10 +101,6 @@ func NewServer(ctx context.Context, config *Config) (*Server, error) {
 		routes.SetDefaultRoute(config.Default, scalingTarget, waker, sleeper, "", "")
 	}
 
-	if config.ConnectionRateLimit < 1 {
-		config.ConnectionRateLimit = 1
-	}
-
 	connector := NewConnector(ctx, routes, downscaler, metricsBuilder.BuildConnectorMetrics(), config.UseProxyProtocol, config.RecordLogins, autoScaleAllowDenyConfig)
 
 	connector.UseBackendDialTimeout(config.BackendDialTimeout)
@@ -245,6 +241,7 @@ func (s *Server) Run() {
 	err := s.connector.StartAcceptingConnections(
 		net.JoinHostPort("", strconv.Itoa(s.config.Port)),
 		s.config.ConnectionRateLimit,
+		s.config.ConnRateLimitPerIP,
 		s.config.MetricsRateLimitPeriod,
 	)
 	if err != nil {
