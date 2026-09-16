@@ -437,12 +437,12 @@ func (c *Connector) HandleConnection(frontendConn net.Conn) {
 }
 
 // serveStatus writes a predefined status JSON and optionally handles ping/pong
-func (c *Connector) serveStatus(frontendConn net.Conn, reader *bufio.Reader, serverAddress string, clientProtocol int) {
+func (c *Connector) serveStatus(frontendConn net.Conn, reader *bufio.Reader, serverAddress string, clientProtocol int, wakeable bool) {
 	motd := ""
 	if c.isWakeInProgress(serverAddress) {
-		motd = c.getLoadingMOTD(serverAddress)
+		motd = c.getLoadingMOTD(serverAddress, wakeable)
 	} else {
-		motd = c.getAsleepMOTD(serverAddress)
+		motd = c.getAsleepMOTD(serverAddress, wakeable)
 	}
 	if motd == "" {
 		return
@@ -529,12 +529,12 @@ func (c *Connector) serveStatus(frontendConn net.Conn, reader *bufio.Reader, ser
 }
 
 // serveLegacyStatus writes a simple legacy SLP response and closes the connection
-func (c *Connector) serveLegacyStatus(frontendConn net.Conn, serverAddress string) {
+func (c *Connector) serveLegacyStatus(frontendConn net.Conn, serverAddress string, wakeable bool) {
 	motd := ""
 	if c.isWakeInProgress(serverAddress) {
-		motd = c.getLoadingMOTD(serverAddress)
+		motd = c.getLoadingMOTD(serverAddress, wakeable)
 	} else {
-		motd = c.getAsleepMOTD(serverAddress)
+		motd = c.getAsleepMOTD(serverAddress, wakeable)
 	}
 	if motd == "" {
 		return
@@ -759,9 +759,9 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			_, _ = io.CopyN(io.Discard, preReadContent, int64(handshakeBytes))
 			br := bufio.NewReader(io.MultiReader(preReadContent, frontendConn))
 			if isLegacy {
-				c.serveLegacyStatus(frontendConn, serverAddress)
+				c.serveLegacyStatus(frontendConn, serverAddress, waker != nil)
 			} else {
-				c.serveStatus(frontendConn, br, serverAddress, clientProtocol)
+				c.serveStatus(frontendConn, br, serverAddress, clientProtocol, waker != nil)
 			}
 		}
 		return
@@ -811,7 +811,12 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			}
 		}
 
-		if waker != nil && nextState == mcproto.StateStatus {
+		// A backend that cannot be woken still has something to say: its per-route MOTD
+		// explains why it is down. Gating this on a waker silently discarded that
+		// message and closed the connection with zero bytes, so the player's server
+		// list showed only "can't connect". getAsleepMOTD keeps the global wake
+		// invitation restricted to routes that can actually wake.
+		if nextState == mcproto.StateStatus {
 			logrus.WithFields(logrus.Fields{
 				"client":   clientAddr,
 				"server":   serverAddress,
@@ -823,9 +828,9 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			_, _ = io.CopyN(io.Discard, preReadContent, int64(handshakeBytes))
 			br := bufio.NewReader(io.MultiReader(preReadContent, frontendConn))
 			if isLegacy {
-				c.serveLegacyStatus(frontendConn, resolvedHost)
+				c.serveLegacyStatus(frontendConn, resolvedHost, waker != nil)
 			} else {
-				c.serveStatus(frontendConn, br, resolvedHost, clientProtocol)
+				c.serveStatus(frontendConn, br, resolvedHost, clientProtocol, waker != nil)
 			}
 		}
 
@@ -1061,22 +1066,32 @@ func (c *Connector) isWakeInProgress(serverAddress string) bool {
 	return c.wakingServers.GetCount(serverAddress) > 0
 }
 
-func (c *Connector) getAsleepMOTD(serverAddress string) string {
-	motd := c.routes.GetAsleepMOTD(serverAddress)
-	if motd == "" {
-		motd = c.asleepMOTD
+// getAsleepMOTD resolves the message shown for a backend that cannot be reached.
+//
+// A per-route MOTD is always authoritative: it is set per server to explain WHY the
+// server is unavailable (the owner stopped it, billing gated it, it failed to boot),
+// and such a server is deliberately not wakeable. The global asleep MOTD invites the
+// player to join in order to wake the server, so it is only truthful for a route that
+// can actually wake — serving it for a non-wakeable route would tell the player to do
+// something that cannot work.
+func (c *Connector) getAsleepMOTD(serverAddress string, wakeable bool) string {
+	if motd := c.routes.GetAsleepMOTD(serverAddress); motd != "" {
+		return motd
 	}
-	return motd
+	if wakeable {
+		return c.asleepMOTD
+	}
+	return ""
 }
 
-func (c *Connector) getLoadingMOTD(serverAddress string) string {
+func (c *Connector) getLoadingMOTD(serverAddress string, wakeable bool) string {
 	motd := c.routes.GetLoadingMOTD(serverAddress)
 	if motd == "" {
 		motd = c.loadingMOTD
 	}
 	// If no specific loading MOTD, fall back to asleep MOTD
 	if motd == "" {
-		return c.getAsleepMOTD(serverAddress)
+		return c.getAsleepMOTD(serverAddress, wakeable)
 	}
 	return motd
 }

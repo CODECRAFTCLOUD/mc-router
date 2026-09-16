@@ -108,11 +108,11 @@ func TestConnectorGetLoadingMOTD(t *testing.T) {
 
 	c := NewConnector(t.Context(), routes, NewDownScaler(false, 5*time.Second), discardMetricsBuilder{}.BuildConnectorMetrics(), false, false, nil)
 	c.UseLoadingMOTD("global loading")
-	assert.Equal(t, "route loading", c.getLoadingMOTD("mc.example.com"))
-	assert.Equal(t, "global loading", c.getLoadingMOTD("other.example.com"))
+	assert.Equal(t, "route loading", c.getLoadingMOTD("mc.example.com", true))
+	assert.Equal(t, "global loading", c.getLoadingMOTD("other.example.com", true))
 
 	routes.SetDefaultRoute("default:25565", nil, nil, nil, "", "default loading")
-	assert.Equal(t, "default loading", c.getLoadingMOTD(""))
+	assert.Equal(t, "default loading", c.getLoadingMOTD("", true))
 }
 
 func writeTestPacket(w io.Writer, packetID int32, payload func(w io.Writer)) error {
