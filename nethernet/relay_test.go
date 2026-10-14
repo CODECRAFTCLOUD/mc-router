@@ -853,3 +853,23 @@ func TestRelayAgesItsOwnSessionsOnTheMonotonicClock(t *testing.T) {
 	r.reap(time.Now())
 	assert.NotNil(t, r.activeSession(testPair), "a session this replica created is aged on its own monotonic clock")
 }
+
+// A4-1: the reaper ages an adopted session from its first signal on any
+// replica, not from the moment this replica adopted it.
+func TestRelayReapsAnAdoptedSessionFromItsFirstSignal(t *testing.T) {
+	bds := startBDS(t)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer conn.Close()
+	opt := defaultOpts(nil)
+	opt.HardReap = 10 * time.Minute
+	r, err := NewRelay(conn, NewMemoryRegistry(), nil, opt)
+	require.NoError(t, err)
+	s := session(bds)
+	s.CreatedAt = time.Now().UTC().Add(-opt.HardReap + 2*time.Second) // signaled elsewhere, 2 s short of HardReap
+	rs, reason := r.bind(netip.MustParseAddrPort("127.0.0.1:40000"), testPair, s, true)
+	require.NotNil(t, rs, reason)
+	r.reap(time.Now().Add(5 * time.Second))
+	assert.Nil(t, r.activeSession(testPair), "adopted session is hard-reaped from its first-signal age")
+	r.closeAll()
+}
