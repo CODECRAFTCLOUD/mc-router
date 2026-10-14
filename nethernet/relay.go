@@ -16,9 +16,11 @@ const (
 	// registryTimeout bounds every shared-registry call.
 	registryTimeout = 250 * time.Millisecond
 	// Shared-registry work runs on a few workers behind a bounded queue, never on
-	// the read loop: a full queue drops the job and the client's retransmit retries.
+	// the read loop: a full queue drops the job; lookups retry on the client's
+	// retransmit, publishes on the next datagram after sharedRetry.
 	sharedWorkers = 4
 	sharedQueue   = 256
+	sharedRetry   = time.Second
 	// A key is looked up at most once per 1-2 s (de-dup while in flight plus a
 	// negative cache), and at most maxLookupKeys distinct keys per window.
 	lookupWindow  = time.Second
@@ -409,7 +411,8 @@ func (r *Relay) queuePublish(rs *relaySession) {
 	select {
 	case r.jobs <- func(ctx context.Context) { r.publish(ctx, rs) }:
 		rs.publishing = true
-	default: // queue full: lastShared stays set, so forward retries after IdleTimeout/2
+	default: // queue full: back-date lastShared so forward retries after sharedRetry (RN-4)
+		rs.lastShared.Store(r.since() + int64(sharedRetry-r.opt.IdleTimeout/2))
 		r.opt.Metrics.queueFull()
 	}
 }

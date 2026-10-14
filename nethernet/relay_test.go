@@ -799,7 +799,7 @@ func TestRelayCountsAFullQueueOnItsOwnCounterOncePerRefresh(t *testing.T) {
 	r.forward(rs, dtlsData)
 	bds.expect(t, dtlsData)
 	bds.expect(t, dtlsData)
-	assert.Equal(t, 1.0, testutil.ToFloat64(m.RegistryQueueFull), "one skipped write per IdleTimeout/2, not one per datagram")
+	assert.Equal(t, 1.0, testutil.ToFloat64(m.RegistryQueueFull), "one skipped write per retry backoff, not one per datagram")
 	assert.Equal(t, 0.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("queue_full")), "the datagram was forwarded, not dropped")
 	assert.Equal(t, 0.0, testutil.ToFloat64(m.RegistryErrors), "a full queue is not a registry error")
 }
@@ -897,4 +897,38 @@ func TestRelayStampsClientTrafficOnItsMonotonicEpoch(t *testing.T) {
 	assert.NotNil(t, r.activeSession(testPair), "a session that just sent is not idle")
 	r.reap(time.Now().Add(2 * time.Minute))
 	assert.Nil(t, r.activeSession(testPair), "an idle bound session is still reaped on the monotonic clock")
+}
+
+// A4-3 (ruling RN-4 (b)): a refresh skipped on a full queue is retried about a
+// second later, not IdleTimeout/2 later, so the shared keys (TTL IdleTimeout)
+// keep their one-refresh slack.
+func TestRelayRetriesASkippedSharedWriteAfterABackoff(t *testing.T) {
+	bds := startBDS(t)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer conn.Close()
+	m := NewMetrics(prometheus.NewRegistry())
+	r, err := NewRelay(conn, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(m)) // IdleTimeout 1 min
+	require.NoError(t, err)
+	for range sharedQueue { // no Serve, so nothing drains the queue
+		r.jobs <- func(context.Context) {}
+	}
+	up, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(bds.addr))
+	require.NoError(t, err)
+	defer up.Close()
+	rs := &relaySession{pair: testPair, upstream: up}
+
+	r.forward(rs, dtlsData)
+	bds.expect(t, dtlsData)
+	time.Sleep(sharedRetry + 100*time.Millisecond)
+	r.forward(rs, dtlsData)
+	bds.expect(t, dtlsData)
+	assert.Equal(t, 2.0, testutil.ToFloat64(m.RegistryQueueFull), "the skipped write was retried after the backoff")
+
+	<-r.jobs // room again: the next retry is queued
+	time.Sleep(sharedRetry + 100*time.Millisecond)
+	r.forward(rs, dtlsData)
+	bds.expect(t, dtlsData)
+	assert.Equal(t, 2.0, testutil.ToFloat64(m.RegistryQueueFull))
+	assert.Len(t, r.jobs, sharedQueue, "the retry took the free slot")
 }
