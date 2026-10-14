@@ -347,7 +347,7 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 	}
 	if rs == nil { // signaled on another replica: it counts here once it binds
 		if r.opt.HardReap > 0 && time.Since(s.CreatedAt) > r.opt.HardReap {
-			return nil, "unknown_peer" // hard-reaped: never adopted again with a fresh age
+			return nil, "hard_reaped" // never adopted again with a fresh age
 		}
 		if !r.roomLocked(s.ServerID) {
 			return nil, "session_cap"

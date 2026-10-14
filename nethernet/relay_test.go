@@ -439,7 +439,8 @@ func TestRelayReapsSessionsPastHardReap(t *testing.T) {
 func TestRelayAdoptionKeepsTheFirstSignalAge(t *testing.T) {
 	bds := startBDS(t)
 	_, shared := sharedRedis(t)
-	opt := defaultOpts(nil)
+	m := NewMetrics(prometheus.NewRegistry())
+	opt := defaultOpts(m)
 	opt.HardReap = 300 * time.Millisecond
 	a, _ := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
 	b, bAddr := startRelay(t, NewMemoryRegistry(), shared, opt)
@@ -453,6 +454,7 @@ func TestRelayAdoptionKeepsTheFirstSignalAge(t *testing.T) {
 		send(t, old, bAddr, check)
 	}
 	assert.True(t, b.activeSession(testPair) == nil, "an old session is not adopted with a fresh age")
+	assert.GreaterOrEqual(t, testutil.ToFloat64(m.UDPDropped.WithLabelValues("hard_reaped")), 1.0)
 	select {
 	case <-bds.got:
 		t.Fatal("BDS got a check of a session past HardReap")
