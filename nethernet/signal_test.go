@@ -528,6 +528,19 @@ func TestSignalLabelsAWakeCallCutShortByWhyItEnded(t *testing.T) {
 		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")))
 		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("refused")))
 	})
+	t.Run("a plain error is refused", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.opts.WakeHold = 5 * time.Second
+		f.asleep()
+		f.waker.result = func(int) (WakeResult, error) { return WakeResult{}, errors.New("nethernet wake: API returned 502") }
+		addr := f.serve(t, 19132)
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("refused")))
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")))
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("cancelled")))
+	})
 }
 
 func TestSignalHoldsWhenAlreadyBooting(t *testing.T) {
