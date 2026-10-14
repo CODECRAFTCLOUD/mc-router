@@ -1,11 +1,14 @@
 package nethernet
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"slices"
 	"strings"
 	"sync"
+
+	"github.com/sirupsen/logrus"
 )
 
 // Backend is one published Bedrock-side server: where its NetherNet signaling
@@ -29,8 +32,10 @@ type routeEntry struct {
 // RouteTable maps hostnames and legacy pool ports to backends. Entries are
 // keyed by the Service ("namespace/name") that published them, so an update
 // replaces all of that Service's hosts at once. When two Services claim one
-// host or port (a leaked Service), the lowest svcKey wins on every replica,
-// whatever the event order, and the next claimant takes over when it goes.
+// host or port (a leaked Service), the highest svcKey wins on every replica,
+// whatever the event order: Services are mc-<ObjectId> and an ObjectId starts
+// with its creation time, so the newest server beats a leaked older one. The
+// next claimant takes over when the winner goes.
 type RouteTable struct {
 	mu      sync.RWMutex
 	entries map[string]routeEntry
@@ -51,19 +56,31 @@ func normalizeHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(host), ".")
 }
 
+// Upsert changes only the claims that differ from svcKey's last Upsert, so a
+// slice event re-running it never logs a conflict again.
 func (t *RouteTable) Upsert(svcKey string, hosts []string, b Backend) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.removeLocked(svcKey)
+	old := t.entries[svcKey]
 	e := routeEntry{backend: b}
 	for _, h := range hosts {
 		if h = normalizeHost(h); h != "" {
 			e.hosts = append(e.hosts, h)
-			addClaim(t.hosts, h, svcKey)
 		}
 	}
+	for _, h := range old.hosts {
+		if !slices.Contains(e.hosts, h) {
+			dropClaim(t.hosts, "host", h, svcKey)
+		}
+	}
+	if p := old.backend.LegacyPort; p > 0 && p != b.LegacyPort {
+		dropClaim(t.legacy, "legacyPort", p, svcKey)
+	}
+	for _, h := range e.hosts {
+		addClaim(t.hosts, "host", h, svcKey)
+	}
 	if b.LegacyPort > 0 {
-		addClaim(t.legacy, b.LegacyPort, svcKey)
+		addClaim(t.legacy, "legacyPort", b.LegacyPort, svcKey)
 	}
 	t.entries[svcKey] = e
 }
@@ -71,39 +88,48 @@ func (t *RouteTable) Upsert(svcKey string, hosts []string, b Backend) {
 func (t *RouteTable) Remove(svcKey string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.removeLocked(svcKey)
-}
-
-func (t *RouteTable) removeLocked(svcKey string) {
 	e, ok := t.entries[svcKey]
 	if !ok {
 		return
 	}
 	for _, h := range e.hosts {
-		dropClaim(t.hosts, h, svcKey)
+		dropClaim(t.hosts, "host", h, svcKey)
 	}
 	if p := e.backend.LegacyPort; p > 0 {
-		dropClaim(t.legacy, p, svcKey)
+		dropClaim(t.legacy, "legacyPort", p, svcKey)
 	}
 	delete(t.entries, svcKey)
 }
 
-func addClaim[K comparable](m map[K][]string, k K, svcKey string) {
-	if i, found := slices.BinarySearch(m[k], svcKey); !found {
-		m[k] = slices.Insert(m[k], i, svcKey)
+func addClaim[K comparable](m map[K][]string, kind string, k K, svcKey string) {
+	i, found := slices.BinarySearch(m[k], svcKey)
+	if found {
+		return
+	}
+	m[k] = slices.Insert(m[k], i, svcKey)
+	if len(m[k]) > 1 {
+		warnClaim(kind, k, m[k], "nethernet: Services claim the same route; the newest (highest name) wins")
 	}
 }
 
-func dropClaim[K comparable](m map[K][]string, k K, svcKey string) {
+func dropClaim[K comparable](m map[K][]string, kind string, k K, svcKey string) {
 	i, found := slices.BinarySearch(m[k], svcKey)
 	if !found {
 		return
+	}
+	if len(m[k]) > 1 {
+		warnClaim(kind, k, m[k], "nethernet: a Service gave up a contested route; the highest remaining name wins")
 	}
 	if c := slices.Delete(m[k], i, i+1); len(c) > 0 {
 		m[k] = c
 	} else {
 		delete(m, k)
 	}
+}
+
+// warnClaim makes a leaked Service visible: it names every claimant, sorted.
+func warnClaim[K comparable](kind string, k K, claimants []string, msg string) {
+	logrus.WithFields(logrus.Fields{"route": fmt.Sprintf("%s %v", kind, k), "claimants": slices.Clone(claimants)}).Warn(msg)
 }
 
 func (t *RouteTable) ByHost(host string) (Backend, bool) {
@@ -122,6 +148,6 @@ func (t *RouteTable) lookupLocked(claims []string) (Backend, bool) {
 	if len(claims) == 0 {
 		return Backend{}, false
 	}
-	e, ok := t.entries[claims[0]]
+	e, ok := t.entries[claims[len(claims)-1]]
 	return e.backend, ok
 }
