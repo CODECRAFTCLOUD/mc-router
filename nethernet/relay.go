@@ -140,8 +140,11 @@ func (r *Relay) Register(ctx context.Context, pair string, s Session) error {
 	return nil
 }
 
-// Serve reads the relay socket until ctx is done, then closes every upstream socket.
+// Serve reads the relay socket until ctx is done, then closes every upstream
+// socket. Its workers and reaper end with it, whatever the reason it returns.
 func (r *Relay) Serve(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stop := context.AfterFunc(ctx, func() { _ = r.conn.SetReadDeadline(time.Now()) })
 	defer stop()
 	defer r.closeAll()

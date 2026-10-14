@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -701,4 +702,31 @@ func TestRelayCoalescesSharedWritesOfARebindingSession(t *testing.T) {
 	defer shared.mu.Unlock()
 	assert.Equal(t, 1, shared.peak, "at most one shared write in flight per session")
 	assert.Less(t, shared.calls, 20, "rebinds are coalesced")
+}
+
+func TestRelayServeLeavesNoGoroutinesWhenItsSocketCloses(t *testing.T) {
+	settled := func(limit int) bool {
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			if runtime.NumGoroutine() <= limit {
+				return true
+			}
+		}
+		return false
+	}
+	before := runtime.NumGoroutine()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	r, err := NewRelay(conn, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(nil))
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() { done <- r.Serve(t.Context()) }() // the context stays live
+	time.Sleep(50 * time.Millisecond)
+	_ = conn.Close()
+	select {
+	case err := <-done:
+		assert.True(t, isClosed(err), "Serve returns the close, got %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+	assert.True(t, settled(before), "workers and reaper exit with Serve: %d goroutines, %d before", runtime.NumGoroutine(), before)
 }
