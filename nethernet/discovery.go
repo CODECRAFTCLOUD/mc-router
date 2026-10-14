@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	core "k8s.io/api/core/v1"
@@ -31,6 +32,10 @@ const (
 	nethernetPortName    = "nethernet"
 )
 
+// syncWarnEvery spaces the startup warnings that name an unsynced informer
+// cache (a missing RBAC rule otherwise hangs startup silently).
+var syncWarnEvery = 30 * time.Second
+
 type serviceRoutes struct {
 	mu       sync.Mutex // one apply at a time, so the last apply reads the newest caches
 	table    *RouteTable
@@ -39,33 +44,58 @@ type serviceRoutes struct {
 }
 
 // WatchServices keeps t in step with the annotated Services in namespace and
-// their EndpointSlices (for the pod IPs). It returns once the initial lists
-// are loaded; the watches run until ctx ends.
+// their EndpointSlices (for the pod IPs). It returns once both event handlers
+// have applied the initial lists, so the table is full; the watches run until
+// ctx ends. While a cache stays unsynced it warns every syncWarnEvery.
 func WatchServices(ctx context.Context, client kubernetes.Interface, namespace string, t *RouteTable) error {
 	factory := informers.NewSharedInformerFactoryWithOptions(client, 0, informers.WithNamespace(namespace))
 	svcInformer := factory.Core().V1().Services()
 	sliceInformer := factory.Discovery().V1().EndpointSlices()
 	r := &serviceRoutes{table: t, services: svcInformer.Lister(), slices: sliceInformer.Lister()}
 
-	if _, err := svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	svcReg, err := svcInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { r.applyKey(obj) },
 		UpdateFunc: func(_, obj any) { r.applyKey(obj) },
 		DeleteFunc: func(obj any) { r.applyKey(obj) },
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
-	if _, err := sliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	sliceReg, err := sliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { r.applySlice(obj) },
 		UpdateFunc: func(_, obj any) { r.applySlice(obj) },
 		DeleteFunc: func(obj any) { r.applySlice(obj) },
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), svcInformer.Informer().HasSynced, sliceInformer.Informer().HasSynced) {
-		return errors.New("nethernet: service/endpointslice informers did not sync")
+
+	// The handlers' HasSynced, not the informers': only it says the initial
+	// list has gone through apply (client-go shared_informer.go).
+	synced := make(chan bool, 1)
+	go func() { synced <- cache.WaitForCacheSync(ctx.Done(), svcReg.HasSynced, sliceReg.HasSynced) }()
+	tick := time.NewTicker(syncWarnEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case ok := <-synced:
+			if !ok {
+				return errors.New("nethernet: service/endpointslice informers did not sync")
+			}
+			return nil
+		case <-tick.C:
+			for _, c := range []struct {
+				resource string
+				reg      cache.ResourceEventHandlerRegistration
+			}{{"services", svcReg}, {"endpointslices", sliceReg}} {
+				if !c.reg.HasSynced() {
+					logrus.WithField("resource", c.resource).
+						Warn("nethernet: informer cache still unsynced; check the router's RBAC for this resource")
+				}
+			}
+		}
 	}
-	return nil
 }
 
 func (r *serviceRoutes) applyKey(obj any) {

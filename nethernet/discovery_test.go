@@ -2,16 +2,24 @@ package nethernet
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	core "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 const b1Namespace = "game"
@@ -235,4 +243,30 @@ func TestDiscoveryRoutesAServiceBeforeItsSlicesExist(t *testing.T) {
 	b, ok := rt.ByHost("survival.uniz.host")
 	require.True(t, ok, "an asleep server still routes so a join can wake it")
 	assert.Empty(t, b.PodIPs)
+}
+
+// M-3: a missing RBAC rule must show in the logs, naming what is unsynced.
+func TestDiscoveryWarnsWhileACacheStaysUnsynced(t *testing.T) {
+	hook := logrustest.NewGlobal()
+	t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{}) })
+	old := syncWarnEvery
+	syncWarnEvery = 20 * time.Millisecond
+	t.Cleanup(func() { syncWarnEvery = old })
+
+	client := fake.NewClientset()
+	client.PrependReactor("list", "endpointslices", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "discovery.k8s.io", Resource: "endpointslices"}, "", errors.New("no RBAC rule"))
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	assert.Error(t, WatchServices(ctx, client, b1Namespace, NewRouteTable()), "the wait still ends only with ctx")
+
+	var named []string
+	for _, e := range hook.AllEntries() {
+		if e.Level == logrus.WarnLevel {
+			named = append(named, fmt.Sprint(e.Data["resource"]))
+		}
+	}
+	assert.Contains(t, named, "endpointslices")
+	assert.NotContains(t, named, "services", "the synced resource is not named")
 }
