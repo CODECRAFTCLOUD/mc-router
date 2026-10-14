@@ -1185,3 +1185,45 @@ func TestSignalAnswers503AtTheSessionCap(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 	assert.False(t, bytes.Contains([]byte(body), []byte("a=candidate")))
 }
+
+// Spec §14 seam (review M-4): one join through both halves. The POST goes
+// through the signal server, and the check the client then signs from the
+// rewritten answer reaches the fake BDS through the relay's own socket. The
+// relay never dials loopback, so its dial to the pod address is pointed at the
+// fake BDS, standing in for the pod network.
+func TestSignalAndRelayCarryOneJoinEndToEnd(t *testing.T) {
+	f := newSigFixture(t)
+	bds := startBDS(t)
+	dialed := make(chan netip.AddrPort, 1)
+	relay, relayAddr := startRelay(t, NewMemoryRegistry(), nil, defaultOpts(nil), func(r *Relay) {
+		r.dialUpstream = func(to netip.AddrPort) (*net.UDPConn, error) {
+			dialed <- to
+			return net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(bds.addr))
+		}
+	})
+	f.opts.Relay, f.opts.PublicAddr = relay, relayAddr
+
+	offer := f.validOffer(t)
+	resp, body := sigDo(t, f.serve(t, 19132), sigReq{body: offer})
+	require.NotNil(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	off, err := ParseSDP(offer)
+	require.NoError(t, err)
+	ans, err := ParseSDP(body)
+	require.NoError(t, err)
+	require.Len(t, ans.Candidates, 1)
+	require.Equal(t, relayAddr, ans.Candidates[0].Addr, "the answer points the client at the relay")
+
+	c := newClient(t)
+	pair := ans.IceUfrag + ":" + off.IceUfrag // RFC 8445: the remote ufrag first
+	check := signedBinding(pair, ans.IcePwd)
+	send(t, c, ans.Candidates[0].Addr, check)
+	bds.expect(t, check)
+	expectReply(t, c, relayAddr, check)
+	assert.Equal(t, netip.MustParseAddrPort(sigTarget), <-dialed, "the relay targets the answer's candidate at the pod")
+	got, bound := relay.boundPair(clientAddr(c))
+	assert.True(t, bound)
+	assert.Equal(t, pair, got)
+	send(t, c, relayAddr, dtlsData)
+	bds.expect(t, dtlsData)
+}

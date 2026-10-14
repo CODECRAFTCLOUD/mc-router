@@ -72,12 +72,16 @@ func (b *fakeBDS) expectNothing(t *testing.T) {
 	}
 }
 
-func startRelay(t *testing.T, local, shared Registry, opt RelayOptions) (*Relay, netip.AddrPort) {
+// startRelay serves a relay on loopback; tweak may adjust it before it serves.
+func startRelay(t *testing.T, local, shared Registry, opt RelayOptions, tweak ...func(*Relay)) (*Relay, netip.AddrPort) {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	r, err := NewRelay(conn, local, shared, opt)
 	require.NoError(t, err)
+	for _, fn := range tweak {
+		fn(r)
+	}
 	done := make(chan struct{})
 	go func() { _ = r.Serve(ctx); close(done) }()
 	t.Cleanup(func() { cancel(); <-done; _ = conn.Close() })
