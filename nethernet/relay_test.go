@@ -436,38 +436,33 @@ func TestRelayReapsSessionsPastHardReap(t *testing.T) {
 	assert.True(t, isClosed(err), "upstream socket is closed, got %v", err)
 }
 
-func TestRelayHardReapSurvivesSharedReadoption(t *testing.T) {
+func TestRelayAdoptionKeepsTheFirstSignalAge(t *testing.T) {
 	bds := startBDS(t)
 	_, shared := sharedRedis(t)
 	opt := defaultOpts(nil)
-	opt.HardReap = 500 * time.Millisecond
+	opt.HardReap = 300 * time.Millisecond
 	a, _ := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
 	b, bAddr := startRelay(t, NewMemoryRegistry(), shared, opt)
+
+	// Signaled on A 600 ms ago: older than B's HardReap, so B must not adopt it.
 	require.NoError(t, a.Register(t.Context(), testPair, session(bds)))
-
-	// B adopts the pair signaled on A, then hard-reaps it while the client is busy.
-	c := newClient(t)
+	time.Sleep(600 * time.Millisecond)
+	old := newClient(t)
 	check := signedBinding(testPair, testPwd)
-	retransmit(t, c, bAddr, check, bds)
-	deadline := time.Now().Add(3 * time.Second)
-	for b.activeSession(testPair) != nil && time.Now().Before(deadline) {
-		send(t, c, bAddr, check)
-		time.Sleep(20 * time.Millisecond)
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		send(t, old, bAddr, check)
 	}
-	require.True(t, b.activeSession(testPair) == nil, "hard-reaped on B")
-	time.Sleep(50 * time.Millisecond)
-	for len(bds.got) > 0 {
-		<-bds.got
+	assert.True(t, b.activeSession(testPair) == nil, "an old session is not adopted with a fresh age")
+	select {
+	case <-bds.got:
+		t.Fatal("BDS got a check of a session past HardReap")
+	default:
 	}
 
-	// B still knows the pair (its local copy, and the shared one): a verified
-	// check must not adopt it again with a fresh age.
-	for range 10 {
-		send(t, c, bAddr, check)
-		time.Sleep(20 * time.Millisecond)
-	}
-	bds.expectNothing(t)
-	assert.True(t, b.activeSession(testPair) == nil, "not re-adopted")
+	// Control: a young session signaled on A is adopted by B.
+	const young = "2c69:Yng1"
+	require.NoError(t, a.Register(t.Context(), young, session(bds)))
+	retransmit(t, newClient(t), bAddr, signedBinding(young, testPwd), bds)
 }
 
 func TestRelaySessionsGaugeTracksSignaledAndBound(t *testing.T) {
