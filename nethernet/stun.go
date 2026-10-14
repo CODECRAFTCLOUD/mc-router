@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/binary"
+	"hash/crc32"
 )
 
 const (
@@ -13,6 +14,14 @@ const (
 	stunAttrIntegrity  = 0x0008
 	stunIntegritySize  = 20
 	stunAttrHeaderSize = 4
+
+	stunBindingRequest     = 0x0001
+	stunBindingSuccess     = 0x0101
+	stunAttrUseCandidate   = 0x0025
+	stunAttrFingerprint    = 0x8028
+	stunAttrICEControlling = 0x802A
+	stunFingerprintXOR     = 0x5354554e
+	stunFingerprintSize    = 4
 )
 
 // IsSTUN reports whether pkt carries a STUN header (RFC 5389 §6). The first
@@ -80,4 +89,61 @@ func VerifyIntegrity(pkt []byte, password string) bool {
 		return false
 	})
 	return ok
+}
+
+// addUseCandidate returns a copy of a client's Binding Request with USE-CANDIDATE
+// (RFC 8445 section 7.1.2) added before MESSAGE-INTEGRITY, re-signed with
+// password and, when the request had one, a new FINGERPRINT last (RFC 8489
+// section 14). It returns pkt itself and false for anything else: a request
+// without ICE-CONTROLLING or a valid MESSAGE-INTEGRITY, one that already
+// carries USE-CANDIDATE, one with attributes after MESSAGE-INTEGRITY other than
+// FINGERPRINT, and every response, DTLS or non-STUN datagram. Only a request
+// the server would accept anyway is re-signed.
+func addUseCandidate(pkt []byte, password string) ([]byte, bool) {
+	if !IsSTUN(pkt) || binary.BigEndian.Uint16(pkt[0:2]) != stunBindingRequest ||
+		stunHeaderLen+int(binary.BigEndian.Uint16(pkt[2:4])) != len(pkt) {
+		return pkt, false
+	}
+	mi, controlling, nominated := -1, false, false
+	stunAttrs(pkt, func(off int, typ uint16, _ []byte) bool {
+		switch typ {
+		case stunAttrICEControlling:
+			controlling = true
+		case stunAttrUseCandidate:
+			nominated = true
+		case stunAttrIntegrity:
+			mi = off
+			return false
+		}
+		return true
+	})
+	if mi < 0 || !controlling || nominated {
+		return pkt, false
+	}
+	rest := pkt[mi+stunAttrHeaderSize+stunIntegritySize:]
+	fingerprint := len(rest) == stunAttrHeaderSize+stunFingerprintSize &&
+		binary.BigEndian.Uint16(rest) == stunAttrFingerprint
+	if len(rest) != 0 && !fingerprint || !VerifyIntegrity(pkt, password) {
+		return pkt, false
+	}
+	out := make([]byte, 0, len(pkt)+stunAttrHeaderSize)
+	out = append(out, pkt[:mi]...)
+	out = binary.BigEndian.AppendUint16(out, stunAttrUseCandidate)
+	out = binary.BigEndian.AppendUint16(out, 0)
+	// The header length covers MESSAGE-INTEGRITY when the HMAC is taken, and
+	// FINGERPRINT when the CRC is.
+	binary.BigEndian.PutUint16(out[2:4], uint16(len(out)-stunHeaderLen+stunAttrHeaderSize+stunIntegritySize))
+	mac := hmac.New(sha1.New, []byte(password))
+	mac.Write(out)
+	out = binary.BigEndian.AppendUint16(out, stunAttrIntegrity)
+	out = binary.BigEndian.AppendUint16(out, stunIntegritySize)
+	out = mac.Sum(out)
+	if fingerprint {
+		binary.BigEndian.PutUint16(out[2:4], uint16(len(out)-stunHeaderLen+stunAttrHeaderSize+stunFingerprintSize))
+		crc := crc32.ChecksumIEEE(out) ^ stunFingerprintXOR
+		out = binary.BigEndian.AppendUint16(out, stunAttrFingerprint)
+		out = binary.BigEndian.AppendUint16(out, stunFingerprintSize)
+		out = binary.BigEndian.AppendUint32(out, crc)
+	}
+	return out, true
 }
