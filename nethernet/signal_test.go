@@ -507,6 +507,29 @@ func TestSignalRefusesARelayTargetThatIsNotThePod(t *testing.T) {
 	assert.Nil(t, f.relay.activeSession("2c69:QXyz"), "nothing is registered")
 }
 
+// R25: while the first Service answers, the host moves to a second Service
+// whose pod is the address the answer names. That pod must not vouch for an
+// answer the first Service wrote.
+func TestSignalChecksTheAnswerOnlyAgainstTheServiceThatAnswered(t *testing.T) {
+	f := newSigFixture(t)
+	f.publish([]netip.Addr{netip.MustParseAddr("10.0.0.9")}, sigLegacy) // game/mc-a: not the answer's 10.0.0.3
+	golden := readGolden(t, "answer-bds-1.26.52.3.sdp")
+	f.backend.setAnswer(func(int32) string {
+		// game/mc-b sorts above game/mc-a, so it now wins the host.
+		f.routes.Upsert("game/mc-b", []string{sigHost}, Backend{ServerID: "other", Addr: netip.MustParseAddrPort("10.0.0.3:19132"),
+			PodIPs: []netip.Addr{netip.MustParseAddr(sigPodIP)}, LegacyPort: sigLegacy + 1})
+		return golden
+	})
+	addr := f.serve(t, 19132)
+	resp, body := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.NotContains(t, body, "a=candidate")
+	assert.Nil(t, f.relay.activeSession("2c69:QXyz"), "nothing is registered")
+	b, _ := f.routes.ByHost(sigHost)
+	require.Equal(t, "other", b.ServerID, "the route did move mid-POST")
+}
+
 func TestSignalLimitsWakesPerPlayer(t *testing.T) {
 	f := newSigFixture(t)
 	f.opts.WakeHold = 50 * time.Millisecond // never ready: each join ends in 503 after its wake
