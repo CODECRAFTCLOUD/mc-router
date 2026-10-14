@@ -587,7 +587,7 @@ func TestSignalBacksOffTheWakeAPIPerPort(t *testing.T) {
 	t.Run("a refusal answers 503 from the cached answer", func(t *testing.T) {
 		f := newSigFixture(t)
 		f.asleep()
-		f.waker.result = func(int) (WakeResult, error) { return WakeResult{}, errors.New("API refused: no credit") }
+		f.waker.result = func(int) (WakeResult, error) { return WakeResult{Message: "no credit"}, nil }
 		clk := &identClock{t: time.Now()}
 		addr := f.serve(t, 19132, func(s *SignalServer) { s.now = clk.now })
 		for i := range 2 {
@@ -618,6 +618,24 @@ func TestSignalBacksOffTheWakeAPIPerPort(t *testing.T) {
 		assert.Equal(t, 1, f.waker.count(), "two joins within 5 s make one API call")
 		assert.Equal(t, 2.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")), "both joins were held")
 		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("refused")))
+	})
+	t.Run("an API failure is not cached", func(t *testing.T) {
+		var calls atomic.Int32
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(api.Close)
+		f := newSigFixture(t)
+		f.asleep()
+		f.opts.Waker = NewAPIWaker(api.URL, "router-token", api.Client())
+		addr := f.serve(t, 19132, func(s *SignalServer) { at := time.Now(); s.now = func() time.Time { return at } })
+		for i := range 2 {
+			resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+			require.NotNil(t, resp, i)
+			assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, i)
+		}
+		assert.Equal(t, int32(2), calls.Load(), "an API 500 is not a refusal: the next join within 5 s asks again")
 	})
 	t.Run("the back-off is per port", func(t *testing.T) {
 		f := newSigFixture(t)

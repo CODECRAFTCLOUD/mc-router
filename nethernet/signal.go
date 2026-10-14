@@ -36,9 +36,9 @@ const (
 	// hour on this replica; a lifted identity assertion can wake, never join.
 	wakesPerPlayer = 5
 	wakeWindow     = time.Hour
-	// Ruling M-5: after a wake call for a legacy port answers booting or a
-	// refusal, that port's answer is reused for this long instead of calling
-	// the API again, which bounds the calls one lifted assertion can cause.
+	// Ruling M-5: after the API answers booting or refuses a legacy port's
+	// wake, that answer is reused for this long instead of calling the API
+	// again, which bounds the calls one lifted assertion can cause.
 	wakeBackoff = 5 * time.Second
 )
 
@@ -413,7 +413,7 @@ func (j *join) wake(ctx context.Context, req *http.Request, offer []byte, b Back
 	if hold.Err() != nil {
 		return refuse(http.StatusServiceUnavailable, "timeout")
 	}
-	res, err, cached := s.backoff.get(b.LegacyPort, s.now())
+	res, cached := s.backoff.get(b.LegacyPort, s.now()) // err is nil here: Verify passed
 	if !cached {
 		at, ok := s.wakes.reserve(who.XUID, s.now())
 		if !ok {
@@ -423,7 +423,9 @@ func (j *join) wake(ctx context.Context, req *http.Request, offer []byte, b Back
 		res, err = s.o.Waker.Wake(hold, b.LegacyPort, who)
 		if err != nil || !res.Woken {
 			s.wakes.release(who.XUID, at)
-			s.backoff.put(b.LegacyPort, cachedWake{at: s.now(), res: res, err: err})
+		}
+		if err == nil && !res.Woken { // an API answer; a failure (network, timeout, non-200) is retried
+			s.backoff.put(b.LegacyPort, cachedWake{at: s.now(), res: res})
 		}
 	}
 	if err != nil || !res.Woken && !res.Booting {
@@ -607,8 +609,10 @@ func (l *wakeLimiter) release(xuid string, at time.Time) {
 }
 
 // wakeBackoffCache holds each legacy port's last booting or refused wake
-// answer for wakeBackoff (Ruling M-5). It holds at most one entry per
-// published legacy port.
+// answer from the API for wakeBackoff (Ruling M-5); a failed call is never
+// held. Joins that miss together, before the first call returns, each call
+// the API: that burst is bounded by the signaling rate limits. It holds at
+// most one entry per published legacy port.
 type wakeBackoffCache struct {
 	mu     sync.Mutex
 	byPort map[int]cachedWake
@@ -617,21 +621,17 @@ type wakeBackoffCache struct {
 type cachedWake struct {
 	at  time.Time
 	res WakeResult
-	err error
 }
 
-func (c *wakeBackoffCache) get(port int, now time.Time) (WakeResult, error, bool) {
+func (c *wakeBackoffCache) get(port int, now time.Time) (WakeResult, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	w, ok := c.byPort[port]
-	if !ok {
-		return WakeResult{}, nil, false
-	}
-	if now.Sub(w.at) >= wakeBackoff {
+	if ok && now.Sub(w.at) >= wakeBackoff {
 		delete(c.byPort, port)
-		return WakeResult{}, nil, false
+		return WakeResult{}, false
 	}
-	return w.res, w.err, true
+	return w.res, ok
 }
 
 func (c *wakeBackoffCache) put(port int, w cachedWake) {
