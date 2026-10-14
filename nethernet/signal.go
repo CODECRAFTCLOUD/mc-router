@@ -450,7 +450,9 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		fail("answer", err)
 		return
 	}
-	if fresh, ok := s.route(req.Host, j.localPort); ok { // PodIPs as of the answer
+	// PodIPs as of the answer, but only of the Service that answered: a route
+	// that moved to another Service meanwhile must not lend it its pods.
+	if fresh, ok := s.route(req.Host, j.localPort); ok && fresh.Addr == b.Addr {
 		b = fresh
 	}
 	var target netip.AddrPort
