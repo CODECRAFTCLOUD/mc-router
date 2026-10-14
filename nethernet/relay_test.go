@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -420,4 +421,94 @@ func TestRelayLooksUpOnlyDTLSShapedStrangersOncePerWindow(t *testing.T) {
 	assert.Eventually(t, func() bool { return shared.lookups.Load() == 1 }, time.Second, 10*time.Millisecond)
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, int32(1), shared.lookups.Load(), "repeated junk from one address costs one lookup")
+}
+
+func TestRelayMovesABoundAddressToANewPairOnAVerifiedCheck(t *testing.T) {
+	bds1, bds2 := startBDS(t), startBDS(t)
+	r, relayAddr := startRelay(t, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(nil))
+	const pair2 = "9f3a:QXyz"
+	require.NoError(t, r.Register(t.Context(), testPair, session(bds1)))
+	require.NoError(t, r.Register(t.Context(), pair2, Session{ServerID: "srv-2", Target: bds2.addr, IcePwd: testPwd}))
+
+	c := newClient(t)
+	first := signedBinding(testPair, testPwd)
+	send(t, c, relayAddr, first)
+	bds1.expect(t, first)
+	expectReply(t, c, relayAddr, first)
+
+	// The same ip:port starts a new join (port-preserving NAT, a quick server switch).
+	second := signedBinding(pair2, testPwd)
+	send(t, c, relayAddr, second)
+	bds2.expect(t, second)
+	expectReply(t, c, relayAddr, second)
+	bds1.expectNothing(t)
+	pair, bound := r.boundPair(clientAddr(c))
+	assert.True(t, bound)
+	assert.Equal(t, pair2, pair)
+}
+
+func TestRelayRebindDeletesTheOldClientKey(t *testing.T) {
+	bds := startBDS(t)
+	mr, shared := sharedRedis(t)
+	r, relayAddr := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
+	require.NoError(t, r.Register(t.Context(), testPair, session(bds)))
+
+	old, moved := newClient(t), newClient(t)
+	for _, c := range []*net.UDPConn{old, moved} {
+		p := signedBinding(testPair, testPwd)
+		send(t, c, relayAddr, p)
+		bds.expect(t, p)
+		expectReply(t, c, relayAddr, p)
+	}
+	assert.Eventually(t, func() bool {
+		return mr.Exists("nn:client:"+clientAddr(moved).String()) && !mr.Exists("nn:client:"+clientAddr(old).String())
+	}, 2*time.Second, 10*time.Millisecond, "the shared registry holds only the new address")
+}
+
+// slowBindRegistry takes 30 ms per BindClient and records how many ran at once.
+type slowBindRegistry struct {
+	Registry
+	mu            sync.Mutex
+	running, peak int
+	calls         int
+	last          netip.AddrPort
+}
+
+func (s *slowBindRegistry) BindClient(ctx context.Context, client netip.AddrPort, pair string, ttl time.Duration) error {
+	s.mu.Lock()
+	s.running++
+	s.calls++
+	s.peak = max(s.peak, s.running)
+	s.mu.Unlock()
+	time.Sleep(30 * time.Millisecond)
+	s.mu.Lock()
+	s.running--
+	s.last = client
+	s.mu.Unlock()
+	return s.Registry.BindClient(ctx, client, pair, ttl)
+}
+
+func TestRelayCoalescesSharedWritesOfARebindingSession(t *testing.T) {
+	bds := startBDS(t)
+	shared := &slowBindRegistry{Registry: NewMemoryRegistry()}
+	r, relayAddr := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
+	require.NoError(t, r.Register(t.Context(), testPair, session(bds)))
+
+	var latest netip.AddrPort
+	for range 20 {
+		c := newClient(t)
+		p := signedBinding(testPair, testPwd)
+		send(t, c, relayAddr, p)
+		bds.expect(t, p)
+		latest = clientAddr(c)
+	}
+	assert.Eventually(t, func() bool {
+		shared.mu.Lock()
+		defer shared.mu.Unlock()
+		return shared.running == 0 && shared.last == latest
+	}, 3*time.Second, 10*time.Millisecond, "the latest address wins")
+	shared.mu.Lock()
+	defer shared.mu.Unlock()
+	assert.Equal(t, 1, shared.peak, "at most one shared write in flight per session")
+	assert.Less(t, shared.calls, 20, "rebinds are coalesced")
 }

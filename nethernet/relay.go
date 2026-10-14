@@ -39,9 +39,12 @@ type relaySession struct {
 	pair       string
 	s          Session
 	upstream   *net.UDPConn
-	client     netip.AddrPort // guarded by Relay.mu
+	client     netip.AddrPort // guarded by Relay.mu; invalid once the address moved to another pair
 	lastSeen   atomic.Int64   // unix nanos of the last client datagram
 	lastShared atomic.Int64   // unix nanos of the last shared-registry refresh
+
+	publishing, republish bool           // guarded by Relay.mu
+	published             netip.AddrPort // the address in nn:client; owned by the one publish in flight
 }
 
 // Relay forwards one public UDP port to many BDS pods. A client address binds
@@ -121,7 +124,13 @@ func (r *Relay) handle(ctx context.Context, from netip.AddrPort, pkt []byte) {
 	rs := r.byClient[from]
 	r.mu.Unlock()
 	if rs != nil { // DTLS records, alerts included, are never inspected
-		r.forward(ctx, from, rs, pkt)
+		if IsSTUN(pkt) {
+			if pair, ok := STUNUsername(pkt); ok && pair != rs.pair { // a new join from a reused address
+				r.bindFromSTUN(ctx, from, pkt)
+				return
+			}
+		}
+		r.forward(rs, pkt)
 		return
 	}
 	if IsSTUN(pkt) {
@@ -254,8 +263,8 @@ func (r *Relay) bindAndForward(ctx context.Context, from netip.AddrPort, pair st
 		r.opt.Metrics.dropped(reason)
 		return
 	}
-	r.publishBinding(ctx, from, rs)
-	r.forward(ctx, from, rs, pkt)
+	r.queuePublish(rs)
+	r.forward(rs, pkt)
 }
 
 func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool) (*relaySession, string) {
@@ -266,8 +275,7 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 			return nil, "unknown_peer"
 		}
 		delete(r.byClient, rs.client)
-		rs.client = client
-		r.byClient[client] = rs
+		r.moveClientLocked(client, rs)
 		return rs, ""
 	}
 	if len(r.byPair) >= r.opt.MaxSessions {
@@ -281,41 +289,84 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 	rs := &relaySession{pair: pair, s: s, upstream: up, client: client}
 	rs.lastSeen.Store(time.Now().UnixNano())
 	r.byPair[pair] = rs
-	r.byClient[client] = rs
+	r.moveClientLocked(client, rs)
 	r.opt.Metrics.activeSessions(len(r.byPair))
 	go r.pipeUpstream(rs)
 	return rs, ""
 }
 
-// publishBinding writes client→pair locally and, best-effort and off the packet
-// path, to the shared registry with the session refreshed alongside.
-func (r *Relay) publishBinding(ctx context.Context, client netip.AddrPort, rs *relaySession) {
-	rs.lastShared.Store(time.Now().UnixNano())
-	ttl := r.opt.IdleTimeout
-	if err := r.local.BindClient(ctx, client, rs.pair, ttl); err != nil {
-		logrus.WithError(err).Debug("nethernet relay: local bind failed")
+// moveClientLocked points client at rs. A session the address leaves keeps
+// its upstream until reaped but answers no one. Callers hold mu.
+func (r *Relay) moveClientLocked(client netip.AddrPort, rs *relaySession) {
+	if prev := r.byClient[client]; prev != nil && prev != rs {
+		prev.client = netip.AddrPort{}
 	}
+	rs.client = client
+	r.byClient[client] = rs
+}
+
+// queuePublish writes rs's binding to the shared registry on a worker. Writes
+// are coalesced: at most one in flight per session, and it carries the latest
+// address. Never blocks.
+func (r *Relay) queuePublish(rs *relaySession) {
 	if r.shared == nil {
 		return
 	}
-	go func() {
-		sctx, cancel := context.WithTimeout(context.Background(), registryTimeout)
-		defer cancel()
-		if err := r.shared.BindClient(sctx, client, rs.pair, ttl); err != nil {
-			r.sharedError("bind client", err, logrus.WarnLevel)
-			return
-		}
-		if err := r.shared.PutSession(sctx, rs.pair, rs.s, ttl); err != nil {
-			r.sharedError("refresh session", err, logrus.WarnLevel)
-		}
-	}()
+	rs.lastShared.Store(time.Now().UnixNano())
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rs.publishing {
+		rs.republish = true
+		return
+	}
+	select {
+	case r.jobs <- func(ctx context.Context) { r.publish(ctx, rs) }:
+		rs.publishing = true
+	default: // queue full: the next forwarded datagram retries
+		rs.lastShared.Store(0)
+		r.opt.Metrics.registryError()
+	}
 }
 
-func (r *Relay) forward(ctx context.Context, from netip.AddrPort, rs *relaySession, pkt []byte) {
+// publish writes client->pair and refreshes the session to the active TTL,
+// deleting the key of the address the session left. Worker only.
+func (r *Relay) publish(ctx context.Context, rs *relaySession) {
+	ttl := r.opt.IdleTimeout
+	for {
+		r.mu.Lock()
+		client, live := rs.client, r.byPair[rs.pair] == rs
+		r.mu.Unlock()
+		if live && client.IsValid() {
+			if rs.published.IsValid() && rs.published != client {
+				r.sharedCall(ctx, "delete client", func(ctx context.Context) error { return r.shared.DeleteClient(ctx, rs.published) })
+			}
+			r.sharedCall(ctx, "bind client", func(ctx context.Context) error { return r.shared.BindClient(ctx, client, rs.pair, ttl) })
+			r.sharedCall(ctx, "refresh session", func(ctx context.Context) error { return r.shared.PutSession(ctx, rs.pair, rs.s, ttl) })
+			rs.published = client
+		}
+		r.mu.Lock()
+		again := rs.republish
+		rs.republish, rs.publishing = false, again
+		r.mu.Unlock()
+		if !again {
+			return
+		}
+	}
+}
+
+func (r *Relay) sharedCall(ctx context.Context, op string, call func(context.Context) error) {
+	sctx, cancel := context.WithTimeout(ctx, registryTimeout)
+	defer cancel()
+	if err := call(sctx); err != nil {
+		r.sharedError(op, err, logrus.WarnLevel)
+	}
+}
+
+func (r *Relay) forward(rs *relaySession, pkt []byte) {
 	now := time.Now().UnixNano()
 	rs.lastSeen.Store(now)
 	if now-rs.lastShared.Load() >= int64(r.opt.IdleTimeout/2) {
-		r.publishBinding(ctx, from, rs)
+		r.queuePublish(rs)
 	}
 	if _, err := rs.upstream.Write(pkt); err != nil {
 		logrus.WithError(err).Debug("nethernet relay: upstream write failed")
@@ -336,6 +387,9 @@ func (r *Relay) pipeUpstream(rs *relaySession) {
 		r.mu.Lock()
 		client := rs.client
 		r.mu.Unlock()
+		if !client.IsValid() {
+			continue
+		}
 		if _, err := r.conn.WriteToUDPAddrPort(buf[:n], client); err != nil {
 			logrus.WithError(err).Debug("nethernet relay: client write failed")
 		}
