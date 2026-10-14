@@ -13,11 +13,12 @@ import (
 
 // Session is what the relay needs to forward one join: where BDS listens and
 // the ICE password that signs the client's connectivity checks. Stored as the
-// spec 6.5 JSON {serverId, target, icePwd}.
+// spec 6.5 JSON {serverId, target, icePwd}, plus signalIp.
 type Session struct {
 	ServerID string         `json:"serverId"`
 	Target   netip.AddrPort `json:"target"`
 	IcePwd   string         `json:"icePwd"`
+	SignalIP netip.Addr     `json:"signalIp"` // the player IP that POSTed the offer
 }
 
 // Registry maps an ICE ufrag pair ("serverUfrag:clientUfrag") to its Session
