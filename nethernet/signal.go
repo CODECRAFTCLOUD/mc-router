@@ -133,10 +133,14 @@ func (s *SignalServer) ServeConn(ctx context.Context, conn net.Conn, localPort i
 	if localPort != s.o.SignalPort {
 		limiter = s.legacy
 	}
-	if ok, scope, logIt := limiter.allow(perIP, s.now()); !ok {
+	if ok, scope, logIt, suppressed := limiter.allow(perIP, s.now()); !ok {
 		s.o.Metrics.signal("rate_limited")
 		if logIt {
-			logrus.WithFields(logrus.Fields{"scope": scope, "ip": perIP}).Warn("nethernet: signaling rate limited")
+			fields := logrus.Fields{"scope": scope, "ip": perIP, "legacy": limiter == s.legacy}
+			if scope == "global" {
+				fields["suppressed"] = suppressed
+			}
+			logrus.WithFields(fields).Warn("nethernet: signaling rate limited")
 		}
 		return
 	}

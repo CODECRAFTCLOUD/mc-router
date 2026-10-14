@@ -31,6 +31,10 @@ type connRateLimiter struct {
 	mu        sync.Mutex
 	perIP     map[netip.Addr]*ipLimiter
 	lastSweep time.Time
+	// The global tier's rejection line: at most one per globalLogEvery, which
+	// carries how many it held back (review M-1).
+	globalLastLog    time.Time
+	globalSuppressed int
 }
 
 type ipLimiter struct {
@@ -48,7 +52,8 @@ const (
 	ipIdleTTL     = 5 * time.Minute
 	// logEvery samples the "throttled" log line per source IP so a flood
 	// cannot turn the log itself into the bottleneck.
-	logEvery = 10 * time.Second
+	logEvery       = 10 * time.Second
+	globalLogEvery = time.Second
 )
 
 // newConnRateLimiter builds a limiter from per-second rates. A rate <= 0
@@ -71,20 +76,28 @@ func newConnRateLimiter(globalPerSec, perIPPerSec int) *connRateLimiter {
 // (a legacy-port join, or a trusted proxy without a PROXY header: the source is
 // the relay, shared by every player behind it) skips the per-IP tier; an IPv6
 // address counts per /64. scope names the tier that rejected it, and logIt is
-// true at most once per logEvery per source so the caller can log a rejection
-// without amplifying a flood.
-func (l *connRateLimiter) allow(addr netip.Addr, now time.Time) (ok bool, scope string, logIt bool) {
+// true at most once per logEvery per source, and once per globalLogEvery for
+// the global tier, so the caller can log a rejection without amplifying a
+// flood; suppressed counts the global rejections not logged since the last line.
+func (l *connRateLimiter) allow(addr netip.Addr, now time.Time) (ok bool, scope string, logIt bool, suppressed int) {
 	if l.perIPRate > 0 && addr.IsValid() {
 		if allowed, shouldLog := l.allowIP(ipKey(addr), now); !allowed {
-			return false, "per_ip", shouldLog
+			return false, "per_ip", shouldLog, 0
 		}
 	}
 
 	if l.global != nil && !l.global.AllowN(now, 1) {
-		return false, "global", true
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if now.Sub(l.globalLastLog) < globalLogEvery {
+			l.globalSuppressed++
+			return false, "global", false, 0
+		}
+		suppressed, l.globalSuppressed, l.globalLastLog = l.globalSuppressed, 0, now
+		return false, "global", true, suppressed
 	}
 
-	return true, "", false
+	return true, "", false, 0
 }
 
 func (l *connRateLimiter) allowIP(addr netip.Addr, now time.Time) (allowed, shouldLog bool) {
