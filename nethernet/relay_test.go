@@ -3,6 +3,7 @@ package nethernet
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -991,4 +992,26 @@ func TestRelayCountsALookupPastItsKeyBudget(t *testing.T) {
 	r.handle(t.Context(), from, signedBinding("extra:QXyz", testPwd))
 	assert.Equal(t, 1.0, testutil.ToFloat64(m.LookupsDropped.WithLabelValues("s")), "the key past the budget is counted")
 	assert.Equal(t, 0.0, testutil.ToFloat64(m.LookupsDropped.WithLabelValues("c")))
+}
+
+// Review M-3: an adopted session whose upstream dial fails gives its cap slots
+// back at once, not at the next reap tick.
+func TestRelayReleasesAnAdoptedSessionWhoseDialFails(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer conn.Close()
+	m := NewMetrics(prometheus.NewRegistry())
+	opt := defaultOpts(m)
+	opt.MaxSessions = 1
+	r, err := NewRelay(conn, NewMemoryRegistry(), nil, opt)
+	require.NoError(t, err)
+	r.dialUpstream = func(netip.AddrPort) (*net.UDPConn, error) { return nil, errors.New("no route") }
+	s := Session{ServerID: "srv-1", Target: netip.MustParseAddrPort("10.0.0.3:19140"), IcePwd: testPwd, CreatedAt: time.Now().UTC()}
+
+	rs, reason := r.bind(netip.MustParseAddrPort("192.0.2.1:40000"), testPair, s, true)
+	assert.Nil(t, rs)
+	assert.Equal(t, "dial_failed", reason)
+	assert.Nil(t, r.activeSession(testPair), "the adopted session is not kept")
+	assert.Equal(t, 0.0, testutil.ToFloat64(m.Sessions.WithLabelValues("srv-1", "signaled")))
+	assert.NoError(t, r.Register(t.Context(), "2c69:0002", s), "its replica slot is free again")
 }

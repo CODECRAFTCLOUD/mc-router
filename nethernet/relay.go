@@ -95,7 +95,9 @@ type Relay struct {
 	// on the replica that handled the POST, for as long as the session lives here.
 	perIP map[ipServer]int
 
-	jobs chan func(context.Context) // client lookups and publishes
+	jobs         chan func(context.Context)                 // client lookups and publishes
+	dialUpstream func(netip.AddrPort) (*net.UDPConn, error) // tests make it fail
+
 	// A flood of client lookups (any DTLS-shaped junk from many source ports)
 	// must not delay a join's first check, which needs a session lookup.
 	clientLookups, sessionLookups lookupBudget
@@ -120,6 +122,9 @@ func NewRelay(conn *net.UDPConn, local Registry, shared Registry, opt RelayOptio
 		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{}, perServer: map[string]int{},
 		perIP: map[ipServer]int{},
 		jobs:  make(chan func(context.Context), sharedQueue)}
+	r.dialUpstream = func(to netip.AddrPort) (*net.UDPConn, error) {
+		return net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(to))
+	}
 	r.clientLookups = lookupBudget{kind: "c", jobs: r.jobs}
 	r.sessionLookups = lookupBudget{kind: "s", jobs: make(chan func(context.Context), sharedQueue)}
 	return r, nil
@@ -375,7 +380,8 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 		r.byClient[client] = rs
 		return rs, ""
 	}
-	if rs == nil { // signaled on another replica: it counts here once it binds
+	adopted := rs == nil
+	if adopted { // signaled on another replica: it counts here once it binds
 		if r.opt.HardReap > 0 && time.Since(s.CreatedAt) > r.opt.HardReap {
 			return nil, "hard_reaped" // never adopted again with a fresh age
 		}
@@ -384,9 +390,12 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 		}
 		rs = r.addLocked(pair, s)
 	}
-	up, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(s.Target))
+	up, err := r.dialUpstream(s.Target)
 	if err != nil {
 		logrus.WithError(err).WithField("serverId", s.ServerID).Warn("nethernet relay: cannot dial BDS")
+		if adopted { // its slots go back now, not at the next reap tick (review M-3)
+			r.dropLocked(pair, rs)
+		}
 		return nil, "dial_failed"
 	}
 	rs.upstream = up
