@@ -914,6 +914,46 @@ In this case the `status` is `"failed-backend-connection"` indicating that a bac
 }
 ```
 
+## NetherNet router
+
+`nethernet-router` is a second binary in the same image (`/nethernet-router`; the image's entrypoint stays `/mc-router`). It routes Bedrock NetherNet joins by hostname: it answers the HTTP/TLS signaling on one TCP port (and on each server's legacy pool port), rewrites the SDP answer to one public candidate, and relays the UDP. It wakes an asleep server through the uniz.host API only for a verified Minecraft identity. It runs as its own DaemonSet, never inside the Java mc-router pods.
+
+Every flag can also be set by its `NETHERNET_<NAME>` environment variable (the prefix keeps clear of the `<SERVICE>_PORT` variables Kubernetes injects). List flags take a comma-separated value.
+
+| Flag | Env | Default | What it does |
+|---|---|---|---|
+| `-signal-port` | `NETHERNET_SIGNAL_PORT` | `19132` | TCP port for NetherNet signaling (HTTP and TLS). A PROXY v2 header is read here only. |
+| `-udp-port` | `NETHERNET_UDP_PORT` | `19132` | UDP port of the relay; also the port every rewritten answer advertises. |
+| `-legacy-port-min` | `NETHERNET_LEGACY_PORT_MIN` | `30000` | First legacy pool port listened on for signaling (old `host:port` addresses). |
+| `-legacy-port-max` | `NETHERNET_LEGACY_PORT_MAX` | `31000` | Last legacy pool port listened on. Must not be below `-legacy-port-min` or contain `-signal-port`. |
+| `-public-ip` | `NETHERNET_PUBLIC_IP` | none (required) | The IPv4 literal every SDP answer advertises. A hostname makes the client fail with `Door`. |
+| `-tls-cert` | `NETHERNET_TLS_CERT` | none | TLS certificate (PEM). Re-read without a restart when the file changes (checked at most every 30 s); a pair that fails to load keeps the last good one. Without it every TLS ClientHello is refused. |
+| `-tls-key` | `NETHERNET_TLS_KEY` | none | TLS private key (PEM). Goes with `-tls-cert`. |
+| `-tls-domains` | `NETHERNET_TLS_DOMAINS` | `uniz.host,mc.uniz.host` | TLS is served only for an SNI under one of these that the loaded certificate covers. Any other SNI gets a `handshake_failure` alert, and the client falls back to plain HTTP. |
+| `-trusted-proxies` | `NETHERNET_TRUSTED_PROXIES` | none | CIDRs whose PROXY v2 header is read on the signal port. Their header's source is the player's address; a trusted proxy that sends no header is not per-IP limited. |
+| `-redis-addr` | `NETHERNET_REDIS_ADDR` | none | `host:port` of the shared session registry. Empty keeps sessions in this replica only. |
+| `-redis-password` | `NETHERNET_REDIS_PASSWORD` | none | Password for the shared session registry. |
+| `-api-url` | `NETHERNET_API_URL` | none (required) | Base URL of the uniz.host API, which serves the wake endpoint. |
+| `-api-token` | `NETHERNET_API_TOKEN` | none (required) | The router's own token for the API's NetherNet wake endpoint. The router refuses to start without it. |
+| `-namespace` | `NETHERNET_NAMESPACE` | `game` | Namespace whose Services publish NetherNet routes. |
+| `-wake-hold` | `NETHERNET_WAKE_HOLD` | `25s` | How long a join to an asleep server is held while it boots, counted from the accept. The client waits 30 s. |
+| `-probe-timeout` | `NETHERNET_PROBE_TIMEOUT` | `300ms` | Dial timeout of the backend readiness probe. |
+| `-identity-jwks-url` | `NETHERNET_IDENTITY_JWKS_URL` | `https://authorization.franchise.minecraft-services.net/.well-known/keys` | Microsoft's JWKS for the Minecraft identity token. Fetched at start and every 6 h. |
+| `-max-sessions` | `NETHERNET_MAX_SESSIONS` | `4096` | Relay sessions per replica. |
+| `-max-sessions-per-server` | `NETHERNET_MAX_SESSIONS_PER_SERVER` | `256` | Relay sessions per server per replica. |
+| `-max-sessions-per-ip-per-server` | `NETHERNET_MAX_SESSIONS_PER_IP_PER_SERVER` | `16` | Relay sessions per player IP (IPv6 /64) per server per replica. |
+| `-unbound-ttl` | `NETHERNET_UNBOUND_TTL` | `60s` | How long a signaled session waits for its first verified STUN check. |
+| `-idle-timeout` | `NETHERNET_IDLE_TIMEOUT` | `30s` | A bound session with no client datagram for this long is dropped. |
+| `-hard-reap` | `NETHERNET_HARD_REAP` | `0s` | Drop any session this old. `0` disables. |
+| `-signal-rate-per-ip` | `NETHERNET_SIGNAL_RATE_PER_IP` | `5` | Signaling connections per second per player IP (IPv6 /64), bursting to 4x. Applies to the player's own address only, never to a relay's. `0` disables. |
+| `-signal-rate-global` | `NETHERNET_SIGNAL_RATE_GLOBAL` | `200` | Signaling connections per second in all, bursting to 2x. `0` disables. |
+| `-max-body` | `NETHERNET_MAX_BODY` | `1048576` | Largest signaling request body, and largest backend answer, in bytes. |
+| `-request-timeout` | `NETHERNET_REQUEST_TIMEOUT` | `5s` | Time from the accept to a fully read signaling request: PROXY header, TLS handshake, headers and body. |
+| `-metrics-binding` | `NETHERNET_METRICS_BINDING` | `:8080` | `host:port` that serves `/metrics` and `/healthz` only. |
+| `-debug` | `NETHERNET_DEBUG` | `false` | Enable debug logs. |
+
+Fixed behaviour that is not a flag: one verified player causes at most 5 actual wakes per rolling hour per replica, and after a wake call for a port answers "booting" or a refusal, that answer is reused for 5 s before the API is called again for that port.
+
 ## Community Solutions
 
 - **[MC Router Discovery](https://github.com/Seedloaf/mc-router-discovery):** A lightweight sidecar to ensure mc-router is in sync with your list of running servers.
