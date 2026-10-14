@@ -396,6 +396,27 @@ func TestSignalServesTLSOnlyForNamesTheCertificateCovers(t *testing.T) {
 	assert.Equal(t, 2.0, testutil.ToFloat64(f.metrics.TLSHandshakes.WithLabelValues("refused_sni")))
 }
 
+// The certificate checked against the SNI is the one the handshake serves,
+// even when the loader hands out another pair in between.
+func TestSignalServesTheCertificateItChecked(t *testing.T) {
+	f := newSigFixture(t)
+	first, second := sigCert(t), sigCert(t)
+	var calls atomic.Int32
+	f.opts.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if calls.Add(1) == 1 {
+			return first, nil
+		}
+		return second, nil
+	}
+	addr := f.serve(t, 19132)
+	raw, err := net.Dial("tcp4", addr)
+	require.NoError(t, err)
+	defer raw.Close()
+	c := tls.Client(raw, &tls.Config{ServerName: "a.uniz.host", InsecureSkipVerify: true}) // the test compares the served cert itself
+	require.NoError(t, c.Handshake())
+	assert.Equal(t, first.Leaf.Raw, c.ConnectionState().PeerCertificates[0].Raw, "the pair that was checked is the pair served")
+}
+
 func TestSignalSynthesizesTheAsleepCard(t *testing.T) {
 	f := newSigFixture(t)
 	f.asleep()
