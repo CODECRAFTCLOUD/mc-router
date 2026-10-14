@@ -29,15 +29,26 @@ const (
 // maximum of sessions; the signal server answers 503.
 var ErrSessionCap = errors.New("nethernet relay: session cap reached")
 
+// ErrInvalidSignalIP is Register's answer to a session marked SignalIPTrusted
+// without a valid SignalIP: a forgotten field must fail loudly, not share one
+// per-IP bucket with every other such session.
+var ErrInvalidSignalIP = errors.New("nethernet relay: a trusted Session.SignalIP must be a valid address")
+
 // RelayOptions bound every session: UnboundTTL for a signaled session that never
 // binds, IdleTimeout without client traffic, HardReap for any session (0 = off).
-// MaxSessions (per replica) and MaxSessionsPerServer count signaled and bound
-// sessions alike.
+// MaxSessions (per replica), MaxSessionsPerServer and MaxPerIPPerServer count
+// signaled and bound sessions alike; MaxPerIPPerServer counts only sessions
+// with a trusted SignalIP, per (IPv4 address or IPv6 /64, server).
 type RelayOptions struct {
-	UnboundTTL, IdleTimeout, HardReap time.Duration
-	MaxSessions, MaxSessionsPerServer int
-	MaxUnboundPerIP                   int // signaled, not yet bound sessions per Session.SignalIP
-	Metrics                           *Metrics
+	UnboundTTL, IdleTimeout, HardReap                    time.Duration
+	MaxSessions, MaxSessionsPerServer, MaxPerIPPerServer int
+	Metrics                                              *Metrics
+}
+
+// ipServer is the per-IP cap's key.
+type ipServer struct {
+	ip     netip.Addr // IPv4, or IPv6 masked to /64
+	server string
 }
 
 // relaySession is a signaled session until a client binds it; then it has one
@@ -47,8 +58,8 @@ type relaySession struct {
 	s           Session
 	created     time.Time
 	upstream    *net.UDPConn   // nil while signaled; set once under Relay.mu
-	signalIP    netip.Addr     // guarded by Relay.mu, with countsForIP
-	countsForIP bool           // still counted in Relay.unboundByIP
+	ipKey       ipServer       // guarded by Relay.mu, with countsForIP
+	countsForIP bool           // counted in Relay.perIP
 	client      netip.AddrPort // guarded by Relay.mu
 	lastSeen    atomic.Int64   // unix nanos of the last client datagram
 	lastShared  atomic.Int64   // unix nanos of the last shared-registry refresh
@@ -69,9 +80,9 @@ type Relay struct {
 	byClient  map[netip.AddrPort]*relaySession
 	byPair    map[string]*relaySession // signaled and bound
 	perServer map[string]int
-	// Signaled, not yet bound sessions per signaling IP; counted only on the
-	// replica that handled the POST.
-	unboundByIP map[netip.Addr]int
+	// Sessions with a trusted signaling IP, per (IP key, server); counted only
+	// on the replica that handled the POST, for as long as the session lives here.
+	perIP map[ipServer]int
 
 	jobs chan func(context.Context)
 	// Keys looked up in this window and the previous one. Read loop only.
@@ -82,30 +93,36 @@ type Relay struct {
 // NewRelay builds a relay on conn. shared may be nil (single replica). A zero
 // timeout or cap is refused: it would make every join fail or never reap.
 func NewRelay(conn *net.UDPConn, local Registry, shared Registry, opt RelayOptions) (*Relay, error) {
-	if opt.UnboundTTL <= 0 || opt.IdleTimeout <= 0 || opt.HardReap < 0 || opt.MaxSessions <= 0 || opt.MaxSessionsPerServer <= 0 || opt.MaxUnboundPerIP <= 0 {
-		return nil, errors.New("nethernet relay: UnboundTTL, IdleTimeout, MaxSessions, MaxSessionsPerServer and MaxUnboundPerIP must be > 0, HardReap >= 0")
+	if opt.UnboundTTL <= 0 || opt.IdleTimeout <= 0 || opt.HardReap < 0 || opt.MaxSessions <= 0 || opt.MaxSessionsPerServer <= 0 || opt.MaxPerIPPerServer <= 0 {
+		return nil, errors.New("nethernet relay: UnboundTTL, IdleTimeout, MaxSessions, MaxSessionsPerServer and MaxPerIPPerServer must be > 0, HardReap >= 0")
 	}
 	return &Relay{conn: conn, local: local, shared: shared, opt: opt,
 		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{}, perServer: map[string]int{},
-		unboundByIP: map[netip.Addr]int{},
-		jobs:        make(chan func(context.Context), sharedQueue)}, nil
+		perIP: map[ipServer]int{},
+		jobs:  make(chan func(context.Context), sharedQueue)}, nil
 }
 
 // Register records a signaled session here, locally and in the shared registry.
-// It returns ErrSessionCap when the replica or s.ServerID is at its cap, or
-// s.SignalIP already holds MaxUnboundPerIP signaled, unbound sessions. A
-// shared-registry error is logged and counted, never returned.
+// It returns ErrSessionCap when the replica or s.ServerID is at its cap, or, for
+// a trusted s.SignalIP, when that IP already holds MaxPerIPPerServer sessions of
+// s.ServerID here; ErrInvalidSignalIP when s.SignalIPTrusted has no valid
+// SignalIP. A shared-registry error is logged and counted, never returned.
 func (r *Relay) Register(ctx context.Context, pair string, s Session) error {
+	if s.SignalIPTrusted && !s.SignalIP.IsValid() {
+		return ErrInvalidSignalIP
+	}
 	r.mu.Lock()
 	if r.byPair[pair] == nil {
-		ip := s.SignalIP.Unmap()
-		if !r.roomLocked(s.ServerID) || r.unboundByIP[ip] >= r.opt.MaxUnboundPerIP {
+		key := ipServer{ipKey(s.SignalIP), s.ServerID}
+		if !r.roomLocked(s.ServerID) || s.SignalIPTrusted && r.perIP[key] >= r.opt.MaxPerIPPerServer {
 			r.mu.Unlock()
 			return ErrSessionCap
 		}
 		rs := r.addLocked(pair, s)
-		rs.signalIP, rs.countsForIP = ip, true
-		r.unboundByIP[ip]++
+		if s.SignalIPTrusted {
+			rs.ipKey, rs.countsForIP = key, true
+			r.perIP[key]++
+		}
 	}
 	r.mu.Unlock()
 	if err := r.local.PutSession(ctx, pair, s, r.opt.UnboundTTL); err != nil {
@@ -326,7 +343,6 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 	rs.lastSeen.Store(time.Now().UnixNano())
 	rs.client = client
 	r.byClient[client] = rs
-	r.releaseIPLocked(rs)
 	r.opt.Metrics.session(s.ServerID, "signaled", -1)
 	r.opt.Metrics.session(s.ServerID, "bound", 1)
 	go r.pipeUpstream(rs)
@@ -478,14 +494,22 @@ func (r *Relay) closeAll() {
 	}
 }
 
+// ipKey is the per-IP cap's address: IPv4 (mapped or not), or the IPv6 /64.
+func ipKey(ip netip.Addr) netip.Addr {
+	if ip = ip.Unmap(); ip.Is6() {
+		return netip.PrefixFrom(ip, 64).Masked().Addr()
+	}
+	return ip
+}
+
 // releaseIPLocked stops counting rs against its signaling IP. Callers hold mu.
 func (r *Relay) releaseIPLocked(rs *relaySession) {
 	if !rs.countsForIP {
 		return
 	}
 	rs.countsForIP = false
-	if r.unboundByIP[rs.signalIP]--; r.unboundByIP[rs.signalIP] <= 0 {
-		delete(r.unboundByIP, rs.signalIP)
+	if r.perIP[rs.ipKey]--; r.perIP[rs.ipKey] <= 0 {
+		delete(r.perIP, rs.ipKey)
 	}
 }
 

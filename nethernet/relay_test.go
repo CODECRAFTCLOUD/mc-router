@@ -82,7 +82,7 @@ func startRelay(t *testing.T, local, shared Registry, opt RelayOptions) (*Relay,
 }
 
 func defaultOpts(m *Metrics) RelayOptions {
-	return RelayOptions{UnboundTTL: time.Minute, IdleTimeout: time.Minute, MaxSessions: 100, MaxSessionsPerServer: 100, MaxUnboundPerIP: 100, Metrics: m}
+	return RelayOptions{UnboundTTL: time.Minute, IdleTimeout: time.Minute, MaxSessions: 100, MaxSessionsPerServer: 100, MaxPerIPPerServer: 100, Metrics: m}
 }
 
 func newClient(t *testing.T) *net.UDPConn {
@@ -329,24 +329,80 @@ func TestRelayRefusesRegisterBeyondThePerServerCap(t *testing.T) {
 	assert.NoError(t, r.Register(t.Context(), "aaaa:0003", Session{ServerID: "srv-2", IcePwd: testPwd}))
 }
 
-func TestRelayRefusesUnboundSessionsBeyondThePerIPCap(t *testing.T) {
+// trusted is a session signaled on the main listener, where PROXY v2 gives the player's own IP.
+func trusted(b *fakeBDS, server, ip string) Session {
+	s := session(b)
+	s.ServerID, s.SignalIP, s.SignalIPTrusted = server, netip.MustParseAddr(ip), true
+	return s
+}
+
+func TestRelayCapsSessionsPerIPPerServer(t *testing.T) {
 	bds := startBDS(t)
 	opt := defaultOpts(nil)
-	opt.MaxUnboundPerIP = 2
-	r, relayAddr := startRelay(t, NewMemoryRegistry(), nil, opt)
-	ipA, ipB := netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("198.51.100.8")
-	from := func(ip netip.Addr) Session { s := session(bds); s.SignalIP = ip; return s }
+	opt.MaxPerIPPerServer = 16
+	r, _ := startRelay(t, NewMemoryRegistry(), nil, opt)
+	for i := range 16 {
+		require.NoError(t, r.Register(t.Context(), fmt.Sprintf("2c69:a%03d", i), trusted(bds, "srv-1", "198.51.100.7")))
+	}
+	assert.ErrorIs(t, r.Register(t.Context(), "2c69:a016", trusted(bds, "srv-1", "198.51.100.7")), ErrSessionCap, "the 17th is refused")
+	assert.ErrorIs(t, r.Register(t.Context(), "2c69:a017", trusted(bds, "srv-1", "::ffff:198.51.100.7")), ErrSessionCap,
+		"an IPv4-mapped address is the same IPv4 key")
+	assert.NoError(t, r.Register(t.Context(), "2c69:b000", trusted(bds, "srv-2", "198.51.100.7")), "another server is unaffected")
+	assert.NoError(t, r.Register(t.Context(), "2c69:c000", trusted(bds, "srv-1", "198.51.100.8")), "another IP is unaffected")
+}
 
-	require.NoError(t, r.Register(t.Context(), testPair, from(ipA)))
-	require.NoError(t, r.Register(t.Context(), "2c69:0002", from(ipA)))
-	assert.ErrorIs(t, r.Register(t.Context(), "2c69:0003", from(ipA)), ErrSessionCap, "the cap is hit")
-	assert.NoError(t, r.Register(t.Context(), "2c69:0004", from(ipB)), "another IP is unaffected")
+func TestRelayBindingDoesNotFreeThePerIPSlot(t *testing.T) {
+	bds := startBDS(t)
+	opt := defaultOpts(nil)
+	opt.MaxPerIPPerServer = 2
+	r, relayAddr := startRelay(t, NewMemoryRegistry(), nil, opt)
+	require.NoError(t, r.Register(t.Context(), testPair, trusted(bds, "srv-1", "198.51.100.7")))
+	require.NoError(t, r.Register(t.Context(), "2c69:0002", trusted(bds, "srv-1", "198.51.100.7")))
 
 	c := newClient(t)
 	p := signedBinding(testPair, testPwd)
 	send(t, c, relayAddr, p)
 	bds.expect(t, p)
-	assert.NoError(t, r.Register(t.Context(), "2c69:0003", from(ipA)), "binding one frees a slot")
+	assert.ErrorIs(t, r.Register(t.Context(), "2c69:0003", trusted(bds, "srv-1", "198.51.100.7")), ErrSessionCap,
+		"a bound session still holds its signaling IP's slot")
+}
+
+func TestRelayDoesNotCountUntrustedSessionsPerIP(t *testing.T) {
+	bds := startBDS(t)
+	opt := defaultOpts(nil)
+	opt.MaxPerIPPerServer, opt.MaxSessionsPerServer = 2, 20
+	r, _ := startRelay(t, NewMemoryRegistry(), nil, opt)
+	legacy := func() Session { // the legacy listener: every player arrives from the relay's address
+		s := session(bds)
+		s.SignalIP = netip.MustParseAddr("10.200.0.1")
+		return s
+	}
+	for i := range 20 {
+		require.NoError(t, r.Register(t.Context(), fmt.Sprintf("2c69:u%03d", i), legacy()))
+	}
+	assert.ErrorIs(t, r.Register(t.Context(), "2c69:u020", legacy()), ErrSessionCap, "the per-server cap still applies")
+}
+
+func TestRelayGroupsIPv6PerSlash64(t *testing.T) {
+	bds := startBDS(t)
+	opt := defaultOpts(nil)
+	opt.MaxPerIPPerServer = 2
+	r, _ := startRelay(t, NewMemoryRegistry(), nil, opt)
+	require.NoError(t, r.Register(t.Context(), "2c69:v001", trusted(bds, "srv-1", "2001:db8:1:2::1")))
+	require.NoError(t, r.Register(t.Context(), "2c69:v002", trusted(bds, "srv-1", "2001:db8:1:2:ffff:ffff:ffff:ffff")))
+	assert.ErrorIs(t, r.Register(t.Context(), "2c69:v003", trusted(bds, "srv-1", "2001:db8:1:2::abcd")), ErrSessionCap, "same /64")
+	assert.NoError(t, r.Register(t.Context(), "2c69:v004", trusted(bds, "srv-1", "2001:db8:1:3::1")), "another /64")
+}
+
+func TestRelayRejectsATrustedSessionWithoutAnIP(t *testing.T) {
+	bds := startBDS(t)
+	r, _ := startRelay(t, NewMemoryRegistry(), nil, defaultOpts(nil))
+	s := session(bds)
+	s.SignalIPTrusted = true
+	err := r.Register(t.Context(), testPair, s)
+	assert.ErrorIs(t, err, ErrInvalidSignalIP)
+	assert.NotErrorIs(t, err, ErrSessionCap)
+	assert.True(t, r.activeSession(testPair) == nil, "nothing is recorded")
 }
 
 func TestRelayReapsSessionsPastHardReap(t *testing.T) {
@@ -425,7 +481,7 @@ func TestNewRelayRejectsZeroTimeouts(t *testing.T) {
 		"IdleTimeout":          func(o *RelayOptions) { o.IdleTimeout = 0 },
 		"MaxSessions":          func(o *RelayOptions) { o.MaxSessions = 0 },
 		"MaxSessionsPerServer": func(o *RelayOptions) { o.MaxSessionsPerServer = -1 },
-		"MaxUnboundPerIP":      func(o *RelayOptions) { o.MaxUnboundPerIP = 0 },
+		"MaxPerIPPerServer":    func(o *RelayOptions) { o.MaxPerIPPerServer = 0 },
 	} {
 		opt := defaultOpts(nil)
 		zero(&opt)

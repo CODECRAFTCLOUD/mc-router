@@ -19,6 +19,10 @@ type Session struct {
 	Target   netip.AddrPort `json:"target"`
 	IcePwd   string         `json:"icePwd"`
 	SignalIP netip.Addr     `json:"signalIp"` // the player IP that POSTed the offer
+	// SignalIPTrusted is true when SignalIP is the player's own address (PROXY v2
+	// on the main listener). On the legacy listener every player arrives from the
+	// relay's address, so it is false there and no per-IP cap applies.
+	SignalIPTrusted bool `json:"signalIpTrusted"`
 }
 
 // Registry maps an ICE ufrag pair ("serverUfrag:clientUfrag") to its Session
