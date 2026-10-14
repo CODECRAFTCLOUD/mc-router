@@ -824,3 +824,22 @@ func TestRelayRegisterReleasesItsSlotsWhenTheLocalWriteFails(t *testing.T) {
 	assert.NoError(t, r.Register(t.Context(), "2c69:0002", trusted(bds, "srv-1", "198.51.100.7")),
 		"the global, per-server and per-IP slots were released")
 }
+
+func TestRelayAgesItsOwnSessionsOnTheMonotonicClock(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer conn.Close()
+	opt := defaultOpts(nil)
+	opt.HardReap = 10 * time.Minute
+	r, err := NewRelay(conn, NewMemoryRegistry(), nil, opt)
+	require.NoError(t, err)
+	require.NoError(t, r.Register(t.Context(), testPair, Session{ServerID: "srv-1", IcePwd: testPwd}))
+
+	// The wall clock steps forward an hour: the wall age of CreatedAt is now past
+	// both UnboundTTL and HardReap, while the session is only milliseconds old.
+	r.mu.Lock()
+	r.byPair[testPair].s.CreatedAt = r.byPair[testPair].s.CreatedAt.Add(-time.Hour)
+	r.mu.Unlock()
+	r.reap(time.Now())
+	assert.NotNil(t, r.activeSession(testPair), "a session this replica created is aged on its own monotonic clock")
+}

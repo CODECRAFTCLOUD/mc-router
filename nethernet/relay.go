@@ -58,7 +58,8 @@ type ipServer struct {
 // upstream socket to BDS and the client address it currently answers to.
 type relaySession struct {
 	pair        string
-	s           Session        // s.CreatedAt is the session's age on every replica
+	s           Session        // s.CreatedAt (wall, UTC) carries the age to other replicas
+	created     time.Time      // monotonic anchor of s.CreatedAt on this replica
 	upstream    *net.UDPConn   // nil while signaled; set once under Relay.mu
 	ipKey       ipServer       // guarded by Relay.mu, with countsForIP
 	countsForIP bool           // counted in Relay.perIP
@@ -377,7 +378,10 @@ func (r *Relay) roomLocked(server string) bool {
 
 // addLocked records a signaled session. Callers hold mu.
 func (r *Relay) addLocked(pair string, s Session) *relaySession {
-	rs := &relaySession{pair: pair, s: s}
+	now := time.Now()
+	// The wall-clock age is read once, here; after that a wall-clock step on this
+	// replica never reaps or keeps a session.
+	rs := &relaySession{pair: pair, s: s, created: now.Add(-now.Sub(s.CreatedAt))}
 	r.byPair[pair] = rs
 	r.perServer[s.ServerID]++
 	r.opt.Metrics.session(s.ServerID, "signaled", 1)
@@ -497,7 +501,7 @@ func (r *Relay) reap(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for pair, rs := range r.byPair {
-		age := now.Sub(rs.s.CreatedAt)
+		age := now.Sub(rs.created)
 		switch {
 		case r.opt.HardReap > 0 && age > r.opt.HardReap,
 			rs.upstream == nil && age > r.opt.UnboundTTL,
