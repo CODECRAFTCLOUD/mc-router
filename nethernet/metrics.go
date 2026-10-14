@@ -1,0 +1,58 @@
+package nethernet
+
+import "github.com/prometheus/client_golang/prometheus"
+
+// Metrics are the router's own series. They register on the registerer given to
+// NewMetrics, never on the default registry the Java mc-router metrics use.
+// A nil *Metrics is valid and records nothing.
+type Metrics struct {
+	SignalingRequests *prometheus.CounterVec // result
+	TLSHandshakes     *prometheus.CounterVec // outcome
+	WakeHolds         *prometheus.CounterVec // outcome
+	Sessions          *prometheus.GaugeVec   // state
+	UDPDropped        *prometheus.CounterVec // reason
+	RegistryErrors    prometheus.Counter
+}
+
+func NewMetrics(reg prometheus.Registerer) *Metrics {
+	m := &Metrics{
+		SignalingRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "nethernet_signaling_requests_total", Help: "NetherNet signaling requests by result.",
+		}, []string{"result"}),
+		TLSHandshakes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "nethernet_tls_handshakes_total", Help: "TLS handshakes on the signaling port by outcome.",
+		}, []string{"outcome"}),
+		WakeHolds: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "nethernet_wake_holds_total", Help: "Signaling requests held for a wake, by outcome.",
+		}, []string{"outcome"}),
+		Sessions: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "nethernet_sessions", Help: "Relay sessions by state.",
+		}, []string{"state"}),
+		UDPDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "nethernet_udp_dropped_total", Help: "UDP datagrams the relay dropped, by reason.",
+		}, []string{"reason"}),
+		RegistryErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "nethernet_registry_errors_total", Help: "Errors from the shared session registry.",
+		}),
+	}
+	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors)
+	return m
+}
+
+func (m *Metrics) dropped(reason string) {
+	if m != nil {
+		m.UDPDropped.WithLabelValues(reason).Inc()
+	}
+}
+
+func (m *Metrics) registryError() {
+	if m != nil {
+		m.RegistryErrors.Inc()
+	}
+}
+
+func (m *Metrics) activeSessions(n int) {
+	if m != nil {
+		m.Sessions.WithLabelValues("active").Set(float64(n))
+	}
+}
