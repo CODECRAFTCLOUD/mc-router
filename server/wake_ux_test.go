@@ -138,3 +138,61 @@ func TestFindAndConnectBackendWakeKick(t *testing.T) {
 		assert.False(t, kicked, "an awake server must NOT kick the player (infinite-loop guard)")
 	})
 }
+
+// The wake allowlist and wake message must be looked up by the normalized host
+// that routing resolved, not the raw handshake address: otherwise a different
+// letter case, a trailing dot or a Forge suffix finds no allowlist and wakes
+// (and bills) a server the player may not wake.
+func TestWakeAllowlistAppliesToAnUnnormalizedHost(t *testing.T) {
+	setup := func(t *testing.T) (*Connector, chan struct{}) {
+		routes := NewRoutes(t.Context())
+		routes.WithDownScaler(NewDownScaler(false, 5*time.Second))
+		woke := make(chan struct{}, 1)
+		waker := func(ctx context.Context) (string, error) { woke <- struct{}{}; return "", nil }
+		// 127.0.0.1:1 refuses instantly → probe fails → treated as asleep.
+		routes.CreateMapping("survival.uniz.host", "127.0.0.1:1", nil, waker, nil, "", "")
+		routes.SetWakeConfig("survival.uniz.host", "custom wake", []string{"steve"})
+		return NewConnector(t.Context(), routes, NewDownScaler(false, 5*time.Second),
+			discardMetricsBuilder{}.BuildConnectorMetrics(), false, false, nil), woke
+	}
+	drive := func(c *Connector, address, playerName string) net.Conn {
+		frontend, tr := net.Pipe()
+		go c.findAndConnectBackend(frontend, &net.TCPAddr{IP: net.IPv4(1, 2, 3, 4)},
+			bytes.NewReader(nil), 0, address, &PlayerInfo{Name: playerName},
+			mcproto.StateLogin, false, 758)
+		_ = tr.SetReadDeadline(time.Now().Add(3 * time.Second))
+		return tr
+	}
+
+	for _, address := range []string{"Survival.Uniz.Host.", "survival.uniz.host\x00FML3\x00"} {
+		t.Run("denied player does not wake: "+address, func(t *testing.T) {
+			c, woke := setup(t)
+			tr := drive(c, address, "alex")
+			defer tr.Close()
+
+			msg, kicked := readLoginDisconnect(tr)
+			require.True(t, kicked, "denied player should be kicked")
+			assert.Contains(t, msg, wakeDenyMessage)
+			select {
+			case <-woke:
+				t.Fatal("waker fired for a player not on the allowlist (would wake + bill)")
+			case <-time.After(500 * time.Millisecond):
+			}
+		})
+
+		t.Run("allowed player gets the route's wake message: "+address, func(t *testing.T) {
+			c, woke := setup(t)
+			tr := drive(c, address, "steve")
+			defer tr.Close()
+
+			msg, kicked := readLoginDisconnect(tr)
+			require.True(t, kicked, "asleep server should kick the joiner")
+			assert.Contains(t, msg, "custom wake")
+			select {
+			case <-woke:
+			case <-time.After(2 * time.Second):
+				t.Fatal("waker was not fired for an allowed player")
+			}
+		})
+	}
+}
