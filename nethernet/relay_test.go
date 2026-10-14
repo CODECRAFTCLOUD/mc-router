@@ -2,8 +2,10 @@ package nethernet
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -105,6 +107,35 @@ func expectReply(t *testing.T, c *net.UDPConn, from netip.AddrPort, want []byte)
 	require.NoError(t, err, "client got no reply")
 	assert.Equal(t, from, src)
 	assert.Equal(t, want, buf[:n])
+}
+
+// retransmit sends pkt every 50 ms, as ICE and DTLS do, until BDS gets it and
+// the client gets the echo, then drains the duplicates a late resend produced.
+func retransmit(t *testing.T, c *net.UDPConn, to netip.AddrPort, pkt []byte, bds *fakeBDS) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for got := false; !got; {
+		require.True(t, time.Now().Before(deadline), "BDS never got the retransmitted packet")
+		send(t, c, to, pkt)
+		select {
+		case b := <-bds.got:
+			assert.Equal(t, pkt, b)
+			got = true
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	expectReply(t, c, to, pkt)
+	time.Sleep(150 * time.Millisecond)
+	for len(bds.got) > 0 {
+		<-bds.got
+	}
+	buf := make([]byte, 2048)
+	for {
+		_ = c.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+		if _, _, err := c.ReadFromUDPAddrPort(buf); err != nil {
+			return
+		}
+	}
 }
 
 func session(b *fakeBDS) Session { return Session{ServerID: "srv-1", Target: b.addr, IcePwd: testPwd} }
@@ -210,10 +241,9 @@ func TestRelayRelaysASessionSignaledOnAnotherReplica(t *testing.T) {
 	require.NoError(t, a.Register(t.Context(), testPair, session(bds)))
 
 	c := newClient(t)
-	stunPkt := signedBinding(testPair, testPwd)
-	send(t, c, bAddr, stunPkt)
-	bds.expect(t, stunPkt)
-	expectReply(t, c, bAddr, stunPkt)
+	// B learns the pair from the shared registry off its read loop, so the
+	// first checks may be dropped; a client retransmits them.
+	retransmit(t, c, bAddr, signedBinding(testPair, testPwd), bds)
 	send(t, c, bAddr, dtlsData)
 	bds.expect(t, dtlsData)
 }
@@ -233,10 +263,8 @@ func TestRelayForwardsNonSTUNFromAClientBoundOnAnotherReplica(t *testing.T) {
 	assert.Eventually(t, func() bool { return mr.Exists("nn:client:" + clientAddr(c).String()) },
 		2*time.Second, 10*time.Millisecond, "bind on A reaches the shared registry")
 
-	// Failover: the next packet of the same client lands on B, and it is DTLS.
-	send(t, c, bAddr, dtlsData)
-	bds.expect(t, dtlsData)
-	expectReply(t, c, bAddr, dtlsData)
+	// Failover: the next packets of the same client land on B, and they are DTLS.
+	retransmit(t, c, bAddr, dtlsData, bds)
 }
 
 func TestRelayReapsIdleSessions(t *testing.T) {
@@ -313,4 +341,83 @@ func TestNewRelayRejectsZeroTimeouts(t *testing.T) {
 	opt.HardReap = 0 // off
 	_, err = NewRelay(conn, NewMemoryRegistry(), nil, opt)
 	assert.NoError(t, err)
+}
+
+// hungRegistry is a shared registry whose every call waits for its context to end,
+// like a Dragonfly that accepts and never answers.
+type hungRegistry struct{}
+
+func (hungRegistry) PutSession(ctx context.Context, _ string, _ Session, _ time.Duration) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (hungRegistry) GetSession(ctx context.Context, _ string) (Session, bool, error) {
+	<-ctx.Done()
+	return Session{}, false, ctx.Err()
+}
+func (hungRegistry) BindClient(ctx context.Context, _ netip.AddrPort, _ string, _ time.Duration) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (hungRegistry) LookupClient(ctx context.Context, _ netip.AddrPort) (string, bool, error) {
+	<-ctx.Done()
+	return "", false, ctx.Err()
+}
+func (hungRegistry) DeleteClient(ctx context.Context, _ netip.AddrPort) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestRelayReadLoopNeverWaitsOnASlowSharedRegistry(t *testing.T) {
+	bds := startBDS(t)
+	r, relayAddr := startRelay(t, NewMemoryRegistry(), hungRegistry{}, defaultOpts(nil))
+	require.NoError(t, r.Register(t.Context(), testPair, session(bds)))
+
+	c := newClient(t)
+	stunPkt := signedBinding(testPair, testPwd)
+	send(t, c, relayAddr, stunPkt)
+	bds.expect(t, stunPkt)
+
+	for i := range 20 {
+		send(t, newClient(t), relayAddr, dtlsData)
+		send(t, newClient(t), relayAddr, signedBinding(fmt.Sprintf("zz%02d:QXyz", i), testPwd))
+	}
+	start := time.Now()
+	send(t, c, relayAddr, dtlsData)
+	select {
+	case got := <-bds.got:
+		assert.Equal(t, dtlsData, got)
+		assert.Less(t, time.Since(start), 50*time.Millisecond, "a bound client waited on the shared registry")
+	case <-time.After(15 * time.Second):
+		t.Fatal("BDS got nothing")
+	}
+}
+
+// countingRegistry counts shared lookups of client addresses.
+type countingRegistry struct {
+	Registry
+	lookups atomic.Int32
+}
+
+func (c *countingRegistry) LookupClient(ctx context.Context, client netip.AddrPort) (string, bool, error) {
+	c.lookups.Add(1)
+	return c.Registry.LookupClient(ctx, client)
+}
+
+func TestRelayLooksUpOnlyDTLSShapedStrangersOncePerWindow(t *testing.T) {
+	shared := &countingRegistry{Registry: NewMemoryRegistry()}
+	_, relayAddr := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
+
+	raknetPing := []byte{0x01, 0, 0, 0, 0, 0, 0, 0, 1}
+	stranger := newClient(t)
+	send(t, stranger, relayAddr, raknetPing)
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int32(0), shared.lookups.Load(), "a non-DTLS stranger costs no lookup")
+
+	for range 5 {
+		send(t, stranger, relayAddr, dtlsData)
+	}
+	assert.Eventually(t, func() bool { return shared.lookups.Load() == 1 }, time.Second, 10*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int32(1), shared.lookups.Load(), "repeated junk from one address costs one lookup")
 }

@@ -12,8 +12,18 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// registryTimeout bounds every shared-registry call so a slow Dragonfly never stalls the packet path.
-const registryTimeout = 250 * time.Millisecond
+const (
+	// registryTimeout bounds every shared-registry call.
+	registryTimeout = 250 * time.Millisecond
+	// Shared-registry work runs on a few workers behind a bounded queue, never on
+	// the read loop: a full queue drops the job and the client's retransmit retries.
+	sharedWorkers = 4
+	sharedQueue   = 256
+	// A key is looked up at most once per 1-2 s (de-dup while in flight plus a
+	// negative cache), and at most maxLookupKeys distinct keys per window.
+	lookupWindow  = time.Second
+	maxLookupKeys = 4096
+)
 
 // RelayOptions bound every session: UnboundTTL for a signaled session that never
 // binds, IdleTimeout without client traffic, HardReap for any session (0 = off).
@@ -45,6 +55,11 @@ type Relay struct {
 	mu       sync.Mutex
 	byClient map[netip.AddrPort]*relaySession
 	byPair   map[string]*relaySession
+
+	jobs chan func(context.Context)
+	// Keys looked up in this window and the previous one. Read loop only.
+	looked, lookedPrev map[string]struct{}
+	lookedUntil        time.Time
 }
 
 // NewRelay builds a relay on conn. shared may be nil (single replica). A zero
@@ -54,7 +69,8 @@ func NewRelay(conn *net.UDPConn, local Registry, shared Registry, opt RelayOptio
 		return nil, errors.New("nethernet relay: UnboundTTL, IdleTimeout, MaxSessions and MaxSessionsPerServer must be > 0, HardReap >= 0")
 	}
 	return &Relay{conn: conn, local: local, shared: shared, opt: opt,
-		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{}}, nil
+		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{},
+		jobs: make(chan func(context.Context), sharedQueue)}, nil
 }
 
 // Register records a signaled session locally and in the shared registry. A
@@ -79,6 +95,9 @@ func (r *Relay) Serve(ctx context.Context) error {
 	defer stop()
 	defer r.closeAll()
 	go r.reapLoop(ctx)
+	for range sharedWorkers {
+		go r.work(ctx)
+	}
 	buf := make([]byte, 64*1024)
 	for {
 		n, from, err := r.conn.ReadFromUDPAddrPort(buf)
@@ -109,7 +128,7 @@ func (r *Relay) handle(ctx context.Context, from netip.AddrPort, pkt []byte) {
 		r.bindFromSTUN(ctx, from, pkt)
 		return
 	}
-	r.bindFromShared(ctx, from, pkt)
+	r.bindFromKnownClient(ctx, from, pkt)
 }
 
 func (r *Relay) bindFromSTUN(ctx context.Context, from netip.AddrPort, pkt []byte) {
@@ -118,8 +137,9 @@ func (r *Relay) bindFromSTUN(ctx context.Context, from netip.AddrPort, pkt []byt
 		r.opt.Metrics.dropped("unknown_peer")
 		return
 	}
-	s, ok := r.lookupSession(ctx, pair)
+	s, ok := r.knownSession(ctx, pair)
 	if !ok {
+		r.queueLookup("s:"+pair, func(ctx context.Context) { r.fetchSession(ctx, pair) })
 		r.opt.Metrics.dropped("unknown_peer")
 		return
 	}
@@ -130,46 +150,71 @@ func (r *Relay) bindFromSTUN(ctx context.Context, from netip.AddrPort, pkt []byt
 	r.bindAndForward(ctx, from, pair, s, true, pkt)
 }
 
-// bindFromShared covers a failover mid-session: the client was verified on
-// another replica and its next datagram (not STUN) lands here.
-func (r *Relay) bindFromShared(ctx context.Context, from netip.AddrPort, pkt []byte) {
-	if r.shared == nil {
-		r.opt.Metrics.dropped("unknown_peer")
-		return
+// bindFromKnownClient covers a failover mid-session: the client was verified on
+// another replica and its next datagram (not STUN) lands here. Only DTLS-shaped
+// datagrams (first byte 20-63, RFC 7983) are worth a shared lookup.
+func (r *Relay) bindFromKnownClient(ctx context.Context, from netip.AddrPort, pkt []byte) {
+	if pair, ok, _ := r.local.LookupClient(ctx, from); ok {
+		if s, ok := r.knownSession(ctx, pair); ok {
+			// rebind=false: a session live on this replica moves only on a verified STUN check.
+			r.bindAndForward(ctx, from, pair, s, false, pkt)
+			return
+		}
 	}
-	sctx, cancel := context.WithTimeout(ctx, registryTimeout)
-	pair, ok, err := r.shared.LookupClient(sctx, from)
-	cancel()
-	if err != nil {
-		r.sharedError("lookup client", err, logrus.DebugLevel)
+	if len(pkt) > 0 && pkt[0] >= 20 && pkt[0] <= 63 {
+		r.queueLookup("c:"+from.String(), func(ctx context.Context) { r.fetchClient(ctx, from) })
 	}
-	if !ok {
-		r.opt.Metrics.dropped("unknown_peer")
-		return
-	}
-	s, ok := r.lookupSession(ctx, pair)
-	if !ok {
-		r.opt.Metrics.dropped("unknown_peer")
-		return
-	}
-	// rebind=false: a session live on this replica moves only on a verified STUN check.
-	r.bindAndForward(ctx, from, pair, s, false, pkt)
+	r.opt.Metrics.dropped("unknown_peer")
 }
 
-// lookupSession finds a pair: live on this replica, then local, then shared.
-func (r *Relay) lookupSession(ctx context.Context, pair string) (Session, bool) {
+// knownSession finds a pair without leaving the process: live here, then local.
+func (r *Relay) knownSession(ctx context.Context, pair string) (Session, bool) {
 	r.mu.Lock()
 	rs := r.byPair[pair]
 	r.mu.Unlock()
 	if rs != nil {
 		return rs.s, true
 	}
-	if s, ok, err := r.local.GetSession(ctx, pair); err == nil && ok {
-		return s, true
-	}
+	s, ok, err := r.local.GetSession(ctx, pair)
+	return s, err == nil && ok
+}
+
+// queueLookup hands a shared-registry lookup to the workers unless key was
+// queued in this window or the last. Read loop only; never blocks.
+func (r *Relay) queueLookup(key string, job func(context.Context)) {
 	if r.shared == nil {
-		return Session{}, false
+		return
 	}
+	if now := time.Now(); now.After(r.lookedUntil) {
+		r.lookedPrev, r.looked, r.lookedUntil = r.looked, map[string]struct{}{}, now.Add(lookupWindow)
+	}
+	if _, ok := r.looked[key]; ok {
+		return
+	}
+	if _, ok := r.lookedPrev[key]; ok || len(r.looked) >= maxLookupKeys {
+		return
+	}
+	select {
+	case r.jobs <- job:
+		r.looked[key] = struct{}{}
+	default: // queue full: the retransmit retries
+	}
+}
+
+func (r *Relay) work(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-r.jobs:
+			job(ctx)
+		}
+	}
+}
+
+// fetchSession copies a pair signaled on another replica into the local
+// registry, where the client's next check finds it. Worker only.
+func (r *Relay) fetchSession(ctx context.Context, pair string) (Session, bool) {
 	sctx, cancel := context.WithTimeout(ctx, registryTimeout)
 	defer cancel()
 	s, ok, err := r.shared.GetSession(sctx, pair)
@@ -177,7 +222,30 @@ func (r *Relay) lookupSession(ctx context.Context, pair string) (Session, bool) 
 		r.sharedError("get session", err, logrus.DebugLevel)
 		return Session{}, false
 	}
+	if ok {
+		_ = r.local.PutSession(ctx, pair, s, r.opt.UnboundTTL)
+	}
 	return s, ok
+}
+
+// fetchClient copies a client binding made on another replica, and its
+// session, into the local registry. Worker only.
+func (r *Relay) fetchClient(ctx context.Context, client netip.AddrPort) {
+	sctx, cancel := context.WithTimeout(ctx, registryTimeout)
+	pair, ok, err := r.shared.LookupClient(sctx, client)
+	cancel()
+	if err != nil {
+		r.sharedError("lookup client", err, logrus.DebugLevel)
+	}
+	if !ok {
+		return
+	}
+	if _, ok := r.knownSession(ctx, pair); !ok {
+		if _, ok := r.fetchSession(ctx, pair); !ok {
+			return
+		}
+	}
+	_ = r.local.BindClient(ctx, client, pair, r.opt.UnboundTTL)
 }
 
 func (r *Relay) bindAndForward(ctx context.Context, from netip.AddrPort, pair string, s Session, rebind bool, pkt []byte) {
