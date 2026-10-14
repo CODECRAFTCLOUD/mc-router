@@ -39,6 +39,10 @@ const (
 	// hour on this replica; a lifted identity assertion can wake, never join.
 	wakesPerPlayer = 5
 	wakeWindow     = time.Hour
+	// Ruling M-5: after a wake call for a legacy port answers booting or a
+	// refusal, that port's answer is reused for this long instead of calling
+	// the API again, which bounds the calls one lifted assertion can cause.
+	wakeBackoff = 5 * time.Second
 )
 
 // tlsHandshakeFailure is the fatal handshake_failure alert BDS sends to a TLS
@@ -80,13 +84,14 @@ type SignalServer struct {
 	getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error) // nil: TLS is never served
 	limiter *connRateLimiter
 	wakes   *wakeLimiter
+	backoff wakeBackoffCache
 	hc      *http.Client
 	now     func() time.Time // for the rate limits; tests freeze it
 }
 
 func NewSignalServer(o SignalOptions) *SignalServer {
 	s := &SignalServer{o: o, limiter: newConnRateLimiter(o.GlobalRate, o.PerIPRate),
-		wakes: &wakeLimiter{byXUID: map[string][]time.Time{}}, now: time.Now}
+		wakes: &wakeLimiter{byXUID: map[string][]time.Time{}}, backoff: wakeBackoffCache{byPort: map[int]cachedWake{}}, now: time.Now}
 	s.getCert = o.GetCertificate
 	if s.getCert == nil && o.TLSCert != nil {
 		s.getCert = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return o.TLSCert, nil }
@@ -410,17 +415,21 @@ func (j *join) wake(ctx context.Context, req *http.Request, offer []byte, b Back
 	if hold.Err() != nil {
 		return refuse(http.StatusServiceUnavailable, "timeout")
 	}
-	at, ok := s.wakes.reserve(who.XUID, s.now())
-	if !ok {
-		logrus.WithFields(logrus.Fields{"serverId": b.ServerID, "xuid": who.XUID}).Warn("nethernet: player wake limit reached")
-		return refuse(http.StatusServiceUnavailable, "player_limit")
-	}
-	res, err := s.o.Waker.Wake(hold, b.LegacyPort, who)
-	if err != nil || !res.Woken {
-		s.wakes.release(who.XUID, at)
+	res, err, cached := s.backoff.get(b.LegacyPort, s.now())
+	if !cached {
+		at, ok := s.wakes.reserve(who.XUID, s.now())
+		if !ok {
+			logrus.WithFields(logrus.Fields{"serverId": b.ServerID, "xuid": who.XUID}).Warn("nethernet: player wake limit reached")
+			return refuse(http.StatusServiceUnavailable, "player_limit")
+		}
+		res, err = s.o.Waker.Wake(hold, b.LegacyPort, who)
+		if err != nil || !res.Woken {
+			s.wakes.release(who.XUID, at)
+			s.backoff.put(b.LegacyPort, cachedWake{at: s.now(), res: res, err: err})
+		}
 	}
 	if err != nil || !res.Woken && !res.Booting {
-		logrus.WithError(err).WithFields(logrus.Fields{"serverId": b.ServerID, "message": res.Message}).Info("nethernet: wake refused")
+		logrus.WithError(err).WithFields(logrus.Fields{"serverId": b.ServerID, "message": res.Message, "cached": cached}).Info("nethernet: wake refused")
 		return refuse(http.StatusServiceUnavailable, "refused")
 	}
 	logrus.WithFields(logrus.Fields{"serverId": b.ServerID, "woken": res.Woken, "gamertag": who.Gamertag}).
@@ -597,4 +606,38 @@ func (l *wakeLimiter) release(xuid string, at time.Time) {
 	if i := slices.IndexFunc(ts, at.Equal); i >= 0 {
 		l.byXUID[xuid] = slices.Delete(ts, i, i+1)
 	}
+}
+
+// wakeBackoffCache holds each legacy port's last booting or refused wake
+// answer for wakeBackoff (Ruling M-5). It holds at most one entry per
+// published legacy port.
+type wakeBackoffCache struct {
+	mu     sync.Mutex
+	byPort map[int]cachedWake
+}
+
+type cachedWake struct {
+	at  time.Time
+	res WakeResult
+	err error
+}
+
+func (c *wakeBackoffCache) get(port int, now time.Time) (WakeResult, error, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w, ok := c.byPort[port]
+	if !ok {
+		return WakeResult{}, nil, false
+	}
+	if now.Sub(w.at) >= wakeBackoff {
+		delete(c.byPort, port)
+		return WakeResult{}, nil, false
+	}
+	return w.res, w.err, true
+}
+
+func (c *wakeBackoffCache) put(port int, w cachedWake) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.byPort[port] = w
 }

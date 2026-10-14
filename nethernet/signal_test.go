@@ -559,12 +559,14 @@ func TestSignalLimitsWakesPerPlayer(t *testing.T) {
 		}
 		return WakeResult{Woken: true}, nil
 	}
-	addr := f.serve(t, 19132)
+	clk := &identClock{t: time.Now()}
+	addr := f.serve(t, 19132, func(s *SignalServer) { s.now = clk.now })
 	offer := f.offerFor(t, "2535400000000777")
 	for i := range 7 {
 		resp, _ := sigDo(t, addr, sigReq{body: offer})
 		require.NotNil(t, resp, i)
 		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, i)
+		clk.add(wakeBackoff) // past the port's wake back-off (M-5), well inside the hour
 	}
 	assert.Equal(t, 7, f.waker.count(), "2 non-wakes + 5 actual wakes reach the API")
 	resp, _ := sigDo(t, addr, sigReq{body: offer})
@@ -576,6 +578,58 @@ func TestSignalLimitsWakesPerPlayer(t *testing.T) {
 	resp, _ = sigDo(t, addr, sigReq{body: f.offerFor(t, "2535400000000888")})
 	require.NotNil(t, resp)
 	assert.Equal(t, 8, f.waker.count(), "another player still wakes")
+}
+
+// Ruling M-5: after a wake call for a legacy port answers booting or a
+// refusal, the API is not called for that port again for 5 s, so one lifted
+// identity assertion cannot drive a wake-API call per join.
+func TestSignalBacksOffTheWakeAPIPerPort(t *testing.T) {
+	t.Run("a refusal answers 503 from the cached answer", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.asleep()
+		f.waker.result = func(int) (WakeResult, error) { return WakeResult{}, errors.New("API refused: no credit") }
+		clk := &identClock{t: time.Now()}
+		addr := f.serve(t, 19132, func(s *SignalServer) { s.now = clk.now })
+		for i := range 2 {
+			resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+			require.NotNil(t, resp, i)
+			assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, i)
+		}
+		assert.Equal(t, 1, f.waker.count(), "two joins within 5 s make one API call")
+		assert.Equal(t, 2.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("refused")))
+
+		clk.add(5 * time.Second)
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, 2, f.waker.count(), "after 5 s the API is asked again")
+	})
+	t.Run("booting goes straight to the hold", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.opts.WakeHold = 200 * time.Millisecond // never ready
+		f.asleep()
+		f.waker.result = func(int) (WakeResult, error) { return WakeResult{Booting: true}, nil }
+		clk := &identClock{t: time.Now()}
+		addr := f.serve(t, 19132, func(s *SignalServer) { s.now = clk.now })
+		for i := range 2 {
+			resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+			require.NotNil(t, resp, i)
+			assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, i)
+		}
+		assert.Equal(t, 1, f.waker.count(), "two joins within 5 s make one API call")
+		assert.Equal(t, 2.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")), "both joins were held")
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("refused")))
+	})
+	t.Run("the back-off is per port", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.asleep()
+		f.routes.Upsert("game/mc-other", []string{"other.uniz.host"}, Backend{ServerID: "other", Addr: f.backend.addr, LegacyPort: sigLegacy + 1})
+		f.waker.result = func(int) (WakeResult, error) { return WakeResult{Message: "manually stopped"}, nil }
+		addr := f.serve(t, 19132, func(s *SignalServer) { at := time.Now(); s.now = func() time.Time { return at } })
+		sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		sigDo(t, addr, sigReq{host: "other.uniz.host:19132", body: f.validOffer(t)})
+		_, ports, _ := f.waker.seen()
+		assert.Equal(t, []int{sigLegacy, sigLegacy + 1}, ports)
+	})
 }
 
 // R34 is a rolling hour: a wake stops counting an hour after it.
