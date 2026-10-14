@@ -174,7 +174,7 @@ func (r *Relay) bindFromSTUN(ctx context.Context, from netip.AddrPort, pkt []byt
 		r.opt.Metrics.dropped("bad_integrity")
 		return
 	}
-	r.bindAndForward(ctx, from, pair, s, true, pkt)
+	r.bindAndForward(from, pair, s, true, pkt)
 }
 
 // bindFromKnownClient covers a failover mid-session: the client was verified on
@@ -184,7 +184,7 @@ func (r *Relay) bindFromKnownClient(ctx context.Context, from netip.AddrPort, pk
 	if pair, ok, _ := r.local.LookupClient(ctx, from); ok {
 		if s, ok := r.knownSession(ctx, pair); ok {
 			// rebind=false: a session live on this replica moves only on a verified STUN check.
-			r.bindAndForward(ctx, from, pair, s, false, pkt)
+			r.bindAndForward(from, pair, s, false, pkt)
 			return
 		}
 	}
@@ -275,7 +275,7 @@ func (r *Relay) fetchClient(ctx context.Context, client netip.AddrPort) {
 	_ = r.local.BindClient(ctx, client, pair, r.opt.UnboundTTL)
 }
 
-func (r *Relay) bindAndForward(ctx context.Context, from netip.AddrPort, pair string, s Session, rebind bool, pkt []byte) {
+func (r *Relay) bindAndForward(from netip.AddrPort, pair string, s Session, rebind bool, pkt []byte) {
 	rs, reason := r.bind(from, pair, s, rebind)
 	if rs == nil {
 		r.opt.Metrics.dropped(reason)
