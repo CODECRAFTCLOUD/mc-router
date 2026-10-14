@@ -52,7 +52,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"outcome"}),
 		AnswerRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "nethernet_answer_retries_total",
-			Help: "Joins whose answer had no candidate at the pod address, by how the re-forwards of the offer ended: an answer that named the pod (recovered), or a 502 (exhausted).",
+			Help: "Joins whose answer had no candidate at the pod address and whose offer was forwarded again, by how the re-forwards ended: an answer that named the pod and a registered session (recovered), or a 502 (exhausted).",
 		}, []string{"outcome"}),
 	}
 	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors, m.RegistryQueueFull, m.LookupsDropped, m.Renominations, m.AnswerRetries)

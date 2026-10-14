@@ -1373,6 +1373,39 @@ func TestSignalGivesUpOnAnAnswerThatNeverNamesThePod(t *testing.T) {
 		assert.Contains(t, logged[0], "pods ["+sigPodIP+"]")
 		assert.Contains(t, logged[0], "10.0.0.77", "next to the answer's candidate IPs")
 	})
+	t.Run("with no time left for a retry", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.opts.WakeHold = 10 * time.Millisecond
+		f.backend.setAnswer(func(n int32) string { return noPodAnswer(t, n) })
+		addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+		assert.Equal(t, int32(1), f.backend.posts.Load())
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")),
+			"a join that failed on its first answer was never retried")
+	})
+}
+
+func TestSignalCountsARecoveryOnlyOnceTheSessionIsRegistered(t *testing.T) {
+	f := newSigFixture(t)
+	f.relay.opt.MaxSessionsPerServer = 1
+	golden := readGolden(t, "answer-bds-1.26.52.3.sdp")
+	f.backend.setAnswer(func(n int32) string {
+		if n == 2 {
+			return noPodAnswer(t, n)
+		}
+		return strings.Replace(golden, "a=ice-ufrag:2c69", fmt.Sprintf("a=ice-ufrag:%04d", n), 1)
+	})
+	addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+	resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+	require.NotNil(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	resp, _ = sigDo(t, addr, sigReq{body: f.validOffer(t)})
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, "the recovered join meets the session cap")
+	assert.Equal(t, int32(3), f.backend.posts.Load(), "the second join was re-forwarded once")
+	assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("recovered")))
 }
 
 func TestSignalRefusesAMalformedOfferBeforeForwardingIt(t *testing.T) {

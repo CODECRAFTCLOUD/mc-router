@@ -514,16 +514,17 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 	retry, cancel := context.WithDeadline(ctx, j.start.Add(s.o.WakeHold))
 	defer cancel()
 	var (
-		b      Backend // the Service that gave the last answer
-		resp   *http.Response
-		answer []byte
-		ans    SDPInfo
-		target netip.AddrPort
+		b        Backend // the Service that gave the last answer
+		resp     *http.Response
+		answer   []byte
+		ans      SDPInfo
+		target   netip.AddrPort
+		forwards int
 	)
 	// exhausted ends a join whose last answer named no pod: the metric, the
 	// candidate IPs next to the pod IPs, and a 502.
-	exhausted := func(forwards int) {
-		if ctx.Err() == nil { // a hang-up is not a failed retry
+	exhausted := func() {
+		if forwards > 1 && ctx.Err() == nil { // only a re-forwarded join is a retry outcome, and a hang-up is none
 			s.o.Metrics.answerRetry("exhausted")
 		}
 		cands := make([]netip.Addr, 0, len(ans.Candidates)) // IPs only: no ports, no ufrag
@@ -532,7 +533,7 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		}
 		fail(b, "no candidate at the pod address", fmt.Errorf("pods %v, answer candidates %v, forwards %d", b.PodIPs, cands, forwards))
 	}
-	for forwards := 1; ; forwards++ {
+	for forwards = 1; ; forwards++ {
 		cur, ok := s.route(req.Host, j.localPort) // re-read each time: the route may have moved
 		if !ok {
 			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
@@ -545,7 +546,7 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		resp, answer, err = s.forward(fctx, cur, req, offer)
 		if err != nil {
 			if forwards > 1 && ctx.Err() == nil && retry.Err() != nil { // the join's deadline cut a retry short
-				exhausted(forwards)
+				exhausted()
 				return
 			}
 			logrus.WithError(err).WithFields(logrus.Fields{"serverId": cur.ServerID, "forwards": forwards}).Debug("nethernet: offer forward failed")
@@ -574,13 +575,10 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 			}
 		}
 		if target.IsValid() {
-			if forwards > 1 {
-				s.o.Metrics.answerRetry("recovered")
-			}
 			break
 		}
 		if forwards == maxAnswerForwards || !s.waitToRetry(retry) {
-			exhausted(forwards)
+			exhausted()
 			return
 		}
 	}
@@ -599,6 +597,9 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 	if err != nil {
 		fail(b, "register", err)
 		return
+	}
+	if forwards > 1 { // recovered only once the session the retry won is registered
+		s.o.Metrics.answerRetry("recovered")
 	}
 	j.reply(http.StatusOK, resp.Header, []byte(rewritten), "answered")
 }
