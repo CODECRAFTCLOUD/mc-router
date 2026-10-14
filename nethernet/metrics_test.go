@@ -18,6 +18,7 @@ func TestNewMetricsRegistersOnTheGivenRegistry(t *testing.T) {
 	m.Sessions.WithLabelValues("srv-1", "bound").Set(1)
 	m.UDPDropped.WithLabelValues("unknown_peer").Inc()
 	m.RegistryErrors.Inc()
+	m.RegistryQueueFull.Inc()
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -28,6 +29,7 @@ func TestNewMetricsRegistersOnTheGivenRegistry(t *testing.T) {
 	assert.ElementsMatch(t, []string{
 		"nethernet_signaling_requests_total", "nethernet_tls_handshakes_total", "nethernet_wake_holds_total",
 		"nethernet_sessions", "nethernet_udp_dropped_total", "nethernet_registry_errors_total",
+		"nethernet_registry_queue_full_total",
 	}, names)
 	assert.Equal(t, 1.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("unknown_peer")))
 }
@@ -37,6 +39,7 @@ func TestNilMetricsIsANoOp(t *testing.T) {
 	assert.NotPanics(t, func() {
 		m.dropped("unknown_peer")
 		m.registryError()
+		m.queueFull()
 		m.session("srv-1", "bound", 1)
 	})
 }

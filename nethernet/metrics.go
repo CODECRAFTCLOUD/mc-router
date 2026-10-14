@@ -12,6 +12,7 @@ type Metrics struct {
 	Sessions          *prometheus.GaugeVec   // server, state (signaled, bound)
 	UDPDropped        *prometheus.CounterVec // reason
 	RegistryErrors    prometheus.Counter
+	RegistryQueueFull prometheus.Counter
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -34,8 +35,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		RegistryErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "nethernet_registry_errors_total", Help: "Errors from the shared session registry.",
 		}),
+		RegistryQueueFull: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "nethernet_registry_queue_full_total",
+			Help: "Shared-registry writes skipped because the worker queue was full; the datagram is still forwarded.",
+		}),
 	}
-	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors)
+	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors, m.RegistryQueueFull)
 	return m
 }
 
@@ -54,5 +59,11 @@ func (m *Metrics) registryError() {
 func (m *Metrics) session(server, state string, delta float64) {
 	if m != nil {
 		m.Sessions.WithLabelValues(server, state).Add(delta)
+	}
+}
+
+func (m *Metrics) queueFull() {
+	if m != nil {
+		m.RegistryQueueFull.Inc()
 	}
 }

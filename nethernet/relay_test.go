@@ -779,7 +779,8 @@ func TestRelayDropsAnOversizedUsernameWithoutALookup(t *testing.T) {
 	}
 }
 
-func TestRelayCountsAFullQueueAsAQueueFullDrop(t *testing.T) {
+func TestRelayCountsAFullQueueOnItsOwnCounterOncePerRefresh(t *testing.T) {
+	bds := startBDS(t)
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
 	defer conn.Close()
@@ -789,8 +790,17 @@ func TestRelayCountsAFullQueueAsAQueueFullDrop(t *testing.T) {
 	for range sharedQueue { // no Serve, so nothing drains the queue
 		r.jobs <- func(context.Context) {}
 	}
-	r.queuePublish(&relaySession{pair: testPair})
-	assert.Equal(t, 1.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("queue_full")))
+	up, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(bds.addr))
+	require.NoError(t, err)
+	defer up.Close()
+	rs := &relaySession{pair: testPair, upstream: up}
+
+	r.forward(rs, dtlsData)
+	r.forward(rs, dtlsData)
+	bds.expect(t, dtlsData)
+	bds.expect(t, dtlsData)
+	assert.Equal(t, 1.0, testutil.ToFloat64(m.RegistryQueueFull), "one skipped write per IdleTimeout/2, not one per datagram")
+	assert.Equal(t, 0.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("queue_full")), "the datagram was forwarded, not dropped")
 	assert.Equal(t, 0.0, testutil.ToFloat64(m.RegistryErrors), "a full queue is not a registry error")
 }
 

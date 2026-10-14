@@ -405,9 +405,8 @@ func (r *Relay) queuePublish(rs *relaySession) {
 	select {
 	case r.jobs <- func(ctx context.Context) { r.publish(ctx, rs) }:
 		rs.publishing = true
-	default: // queue full: the next forwarded datagram retries
-		rs.lastShared.Store(0)
-		r.opt.Metrics.dropped("queue_full")
+	default: // queue full: lastShared stays set, so forward retries after IdleTimeout/2
+		r.opt.Metrics.queueFull()
 	}
 }
 
