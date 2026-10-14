@@ -232,10 +232,8 @@ func TestIdentityAcceptsAValidOffer(t *testing.T) {
 	f := identSetup(t)
 	got, err := f.v.Verify(context.Background(), f.offer(t, nil))
 	require.NoError(t, err)
-	assert.Equal(t, Identity{
-		XUID: "2535400000000001", Gamertag: "Synthetic Steve",
-		ExpiresAt: identStart.Add(4 * time.Hour),
-	}, got)
+	assert.Equal(t, Identity{XUID: "2535400000000001", Gamertag: "Synthetic Steve"}, got,
+		"only what a consumer reads: XUID (wake limiter, API) and gamertag (API wake event)")
 }
 
 func TestIdentityAcceptsAnAudienceArray(t *testing.T) {

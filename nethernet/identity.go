@@ -65,8 +65,10 @@ func NewIdentityVerifier(jwksURL string, hc *http.Client, now func() time.Time) 
 // §5.1): the GameServerToken must be an RS256 JWT from Microsoft's keys with
 // the expected iss, aud and exp, and its detached ES384 "fingerprints" JWS,
 // signed by the token's cpk, must cover exactly this offer's a=fingerprint
-// lines. That binds the token to this offer: a lifted token cannot be replayed
-// with another offer.
+// lines. This proves a real Minecraft player, not this exact offer: an
+// assertion lifted whole, with its a=fingerprint line, still verifies until
+// exp and can cause a wake, but never a join, because DTLS needs the private
+// key behind that fingerprint (guide §5.1; R34 caps wakes per XUID in B3).
 func (v *IdentityVerifier) Verify(ctx context.Context, offerSDP string) (Identity, error) {
 	var identity string
 	var fps []sdpFingerprint
@@ -116,7 +118,7 @@ func (v *IdentityVerifier) Verify(ctx context.Context, offerSDP string) (Identit
 	if err := verifyFingerprints(assertion.Fingerprints, fps, cpk); err != nil {
 		return Identity{}, err
 	}
-	return Identity{XUID: claims.XID, Gamertag: claims.XName, ExpiresAt: time.Unix(claims.Exp, 0)}, nil
+	return Identity{XUID: claims.XID, Gamertag: claims.XName}, nil
 }
 
 type tokenClaims struct {

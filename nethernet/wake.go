@@ -14,9 +14,10 @@ import (
 )
 
 // Identity is a player whose Minecraft identity token verified (identity.go).
+// XUID keys the signal server's per-player wake limit (R34) and goes to the
+// wake API with Gamertag, which the API records on the wake event.
 type Identity struct {
 	XUID, Gamertag string
-	ExpiresAt      time.Time
 }
 
 // WakeResult is the API's answer: Booting means the server is already
