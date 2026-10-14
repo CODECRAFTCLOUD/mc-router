@@ -611,7 +611,7 @@ func TestSignalLimitsWakesPerPlayer(t *testing.T) {
 		case 1:
 			return WakeResult{Booting: true}, nil // not an actual wake
 		case 2:
-			return WakeResult{}, errors.New("refused") // not an actual wake
+			return WakeResult{Message: "no credit"}, nil // a clear refusal: not an actual wake
 		}
 		return WakeResult{Woken: true}, nil
 	}
@@ -788,6 +788,47 @@ func TestWakeLimiterSweepsPlayersWithNoWakeThisHour(t *testing.T) {
 	l.reserve("late", t0.Add(time.Hour+time.Minute+30*time.Second+30*time.Minute))
 	assert.Contains(t, l.byXUID, "late")
 	assert.NotContains(t, l.byXUID, "recent", "swept once its wake is an hour old")
+}
+
+// Ruling C-1: only a clear answer from the API (not woken) hands the wake
+// back. On an error or a cancellation the API may still have woken the
+// server, so the wake stays counted against the player. (A clear refusal and
+// a booting answer handing it back: TestSignalLimitsWakesPerPlayer.)
+func TestSignalKeepsAWakeCountedWhenTheAPIGaveNoClearAnswer(t *testing.T) {
+	limitOne := func(t *testing.T) (*sigFixture, string) {
+		f := newSigFixture(t)
+		f.opts.WakesPerPlayer = 1
+		f.asleep()
+		addr := f.serve(t, 19132, func(s *SignalServer) { at := time.Now(); s.now = func() time.Time { return at } })
+		return f, addr
+	}
+	t.Run("an error", func(t *testing.T) {
+		f, addr := limitOne(t)
+		f.waker.result = func(int) (WakeResult, error) { return WakeResult{}, errors.New("nethernet wake: API returned 502") }
+		for i := range 2 {
+			resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+			require.NotNil(t, resp, i)
+			assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, i)
+		}
+		assert.Equal(t, 1, f.waker.count(), "the second join is over the player's limit, before the API")
+		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("player_limit")))
+	})
+	t.Run("a cancellation", func(t *testing.T) {
+		f, addr := limitOne(t)
+		f.waker.hang = true
+		sigDo(t, addr, sigReq{body: f.validOffer(t), closeAfter: 300 * time.Millisecond})
+		require.Eventually(t, func() bool {
+			return testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("cancelled")) == 1
+		}, 3*time.Second, 20*time.Millisecond)
+		f.waker.mu.Lock()
+		f.waker.hang = false
+		f.waker.mu.Unlock()
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		assert.Equal(t, 1, f.waker.count(), "the second join is over the player's limit, before the API")
+		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("player_limit")))
+	})
 }
 
 func TestSignalAnswers503ForALegacyPortZeroWithoutCallingTheAPI(t *testing.T) {

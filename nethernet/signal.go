@@ -422,10 +422,12 @@ func (j *join) wake(ctx context.Context, req *http.Request, offer []byte, b Back
 			return refuse(http.StatusServiceUnavailable, "player_limit")
 		}
 		res, err = s.o.Waker.Wake(hold, b.LegacyPort, who)
-		if err != nil || !res.Woken {
+		// Only a clear answer (not woken) hands the wake back and is cached. On a
+		// failure (network, timeout, non-200, a hang-up) the API may still have
+		// woken the server, so the wake stays counted (Ruling C-1) and the next
+		// join asks again.
+		if err == nil && !res.Woken {
 			s.wakes.release(who.XUID, at)
-		}
-		if err == nil && !res.Woken { // an API answer; a failure (network, timeout, non-200) is retried
 			s.backoff.put(b.LegacyPort, cachedWake{at: s.now(), res: res})
 		}
 	}
