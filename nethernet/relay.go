@@ -25,20 +25,27 @@ const (
 	maxLookupKeys = 4096
 )
 
+// ErrSessionCap is Register's answer when the replica or the server holds its
+// maximum of sessions; the signal server answers 503.
+var ErrSessionCap = errors.New("nethernet relay: session cap reached")
+
 // RelayOptions bound every session: UnboundTTL for a signaled session that never
 // binds, IdleTimeout without client traffic, HardReap for any session (0 = off).
+// MaxSessions (per replica) and MaxSessionsPerServer count signaled and bound
+// sessions alike.
 type RelayOptions struct {
 	UnboundTTL, IdleTimeout, HardReap time.Duration
 	MaxSessions, MaxSessionsPerServer int
 	Metrics                           *Metrics
 }
 
-// relaySession is a bound session: one upstream socket to BDS and the client
-// address it currently answers to.
+// relaySession is a signaled session until a client binds it; then it has one
+// upstream socket to BDS and the client address it currently answers to.
 type relaySession struct {
 	pair       string
 	s          Session
-	upstream   *net.UDPConn
+	created    time.Time
+	upstream   *net.UDPConn   // nil while signaled; set once under Relay.mu
 	client     netip.AddrPort // guarded by Relay.mu; invalid once the address moved to another pair
 	lastSeen   atomic.Int64   // unix nanos of the last client datagram
 	lastShared atomic.Int64   // unix nanos of the last shared-registry refresh
@@ -55,9 +62,10 @@ type Relay struct {
 	local, shared Registry
 	opt           RelayOptions
 
-	mu       sync.Mutex
-	byClient map[netip.AddrPort]*relaySession
-	byPair   map[string]*relaySession
+	mu        sync.Mutex
+	byClient  map[netip.AddrPort]*relaySession
+	byPair    map[string]*relaySession // signaled and bound
+	perServer map[string]int
 
 	jobs chan func(context.Context)
 	// Keys looked up in this window and the previous one. Read loop only.
@@ -72,13 +80,23 @@ func NewRelay(conn *net.UDPConn, local Registry, shared Registry, opt RelayOptio
 		return nil, errors.New("nethernet relay: UnboundTTL, IdleTimeout, MaxSessions and MaxSessionsPerServer must be > 0, HardReap >= 0")
 	}
 	return &Relay{conn: conn, local: local, shared: shared, opt: opt,
-		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{},
+		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{}, perServer: map[string]int{},
 		jobs: make(chan func(context.Context), sharedQueue)}, nil
 }
 
-// Register records a signaled session locally and in the shared registry. A
+// Register records a signaled session here, locally and in the shared registry.
+// It returns ErrSessionCap when the replica or s.ServerID is at its cap. A
 // shared-registry error is logged and counted, never returned.
 func (r *Relay) Register(ctx context.Context, pair string, s Session) error {
+	r.mu.Lock()
+	if r.byPair[pair] == nil {
+		if !r.roomLocked(s.ServerID) {
+			r.mu.Unlock()
+			return ErrSessionCap
+		}
+		r.addLocked(pair, s)
+	}
+	r.mu.Unlock()
 	if err := r.local.PutSession(ctx, pair, s, r.opt.UnboundTTL); err != nil {
 		return err
 	}
@@ -270,7 +288,8 @@ func (r *Relay) bindAndForward(ctx context.Context, from netip.AddrPort, pair st
 func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool) (*relaySession, string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if rs := r.byPair[pair]; rs != nil {
+	rs := r.byPair[pair]
+	if rs != nil && rs.upstream != nil {
 		if !rebind {
 			return nil, "unknown_peer"
 		}
@@ -278,21 +297,38 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 		r.moveClientLocked(client, rs)
 		return rs, ""
 	}
-	if len(r.byPair) >= r.opt.MaxSessions {
-		return nil, "session_cap"
+	if rs == nil { // signaled on another replica: it counts here once it binds
+		if !r.roomLocked(s.ServerID) {
+			return nil, "session_cap"
+		}
+		rs = r.addLocked(pair, s)
 	}
 	up, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(s.Target))
 	if err != nil {
 		logrus.WithError(err).WithField("serverId", s.ServerID).Warn("nethernet relay: cannot dial BDS")
 		return nil, "dial_failed"
 	}
-	rs := &relaySession{pair: pair, s: s, upstream: up, client: client}
+	rs.upstream = up
 	rs.lastSeen.Store(time.Now().UnixNano())
-	r.byPair[pair] = rs
 	r.moveClientLocked(client, rs)
-	r.opt.Metrics.activeSessions(len(r.byPair))
+	r.opt.Metrics.session(s.ServerID, "signaled", -1)
+	r.opt.Metrics.session(s.ServerID, "bound", 1)
 	go r.pipeUpstream(rs)
 	return rs, ""
+}
+
+// roomLocked reports whether one more session fits the replica and server caps. Callers hold mu.
+func (r *Relay) roomLocked(server string) bool {
+	return len(r.byPair) < r.opt.MaxSessions && r.perServer[server] < r.opt.MaxSessionsPerServer
+}
+
+// addLocked records a signaled session. Callers hold mu.
+func (r *Relay) addLocked(pair string, s Session) *relaySession {
+	rs := &relaySession{pair: pair, s: s, created: time.Now()}
+	r.byPair[pair] = rs
+	r.perServer[s.ServerID]++
+	r.opt.Metrics.session(s.ServerID, "signaled", 1)
+	return rs
 }
 
 // moveClientLocked points client at rs. A session the address leaves keeps
@@ -375,7 +411,7 @@ func (r *Relay) forward(rs *relaySession, pkt []byte) {
 
 // pipeUpstream sends BDS replies to whichever client address the session is bound to now.
 func (r *Relay) pipeUpstream(rs *relaySession) {
-	buf := make([]byte, 64*1024)
+	buf := make([]byte, 8*1024) // WebRTC datagrams stay near 1.2 KB
 	for {
 		n, err := rs.upstream.Read(buf)
 		if err != nil {
@@ -396,10 +432,16 @@ func (r *Relay) pipeUpstream(rs *relaySession) {
 	}
 }
 
-// reapLoop drops sessions with no client datagram for IdleTimeout. Only client
-// traffic counts: a live client sends ICE consent checks on its own.
+// reapLoop drops sessions that never bound within UnboundTTL, bound sessions
+// with no client datagram for IdleTimeout, and any session older than
+// HardReap. Only client traffic counts: a live client sends ICE consent checks
+// on its own.
 func (r *Relay) reapLoop(ctx context.Context) {
-	t := time.NewTicker(max(r.opt.IdleTimeout/2, time.Millisecond))
+	tick := min(r.opt.IdleTimeout, r.opt.UnboundTTL)
+	if r.opt.HardReap > 0 {
+		tick = min(tick, r.opt.HardReap)
+	}
+	t := time.NewTicker(max(tick/2, time.Millisecond))
 	defer t.Stop()
 	for {
 		select {
@@ -415,11 +457,14 @@ func (r *Relay) reap(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for pair, rs := range r.byPair {
-		if now.UnixNano()-rs.lastSeen.Load() > int64(r.opt.IdleTimeout) {
+		age := now.Sub(rs.created)
+		switch {
+		case r.opt.HardReap > 0 && age > r.opt.HardReap,
+			rs.upstream == nil && age > r.opt.UnboundTTL,
+			rs.upstream != nil && now.UnixNano()-rs.lastSeen.Load() > int64(r.opt.IdleTimeout):
 			r.dropLocked(pair, rs)
 		}
 	}
-	r.opt.Metrics.activeSessions(len(r.byPair))
 }
 
 func (r *Relay) closeAll() {
@@ -428,13 +473,22 @@ func (r *Relay) closeAll() {
 	for pair, rs := range r.byPair {
 		r.dropLocked(pair, rs)
 	}
-	r.opt.Metrics.activeSessions(0)
 }
 
 func (r *Relay) dropLocked(pair string, rs *relaySession) {
 	delete(r.byPair, pair)
-	delete(r.byClient, rs.client)
+	if r.byClient[rs.client] == rs {
+		delete(r.byClient, rs.client)
+	}
+	if r.perServer[rs.s.ServerID]--; r.perServer[rs.s.ServerID] <= 0 {
+		delete(r.perServer, rs.s.ServerID)
+	}
+	if rs.upstream == nil {
+		r.opt.Metrics.session(rs.s.ServerID, "signaled", -1)
+		return
+	}
 	_ = rs.upstream.Close()
+	r.opt.Metrics.session(rs.s.ServerID, "bound", -1)
 }
 
 func (r *Relay) sharedError(op string, err error, level logrus.Level) {

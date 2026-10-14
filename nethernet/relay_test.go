@@ -285,7 +285,7 @@ func TestRelayReapsIdleSessions(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	assert.Eventually(t, func() bool { _, bound := r.boundPair(clientAddr(c)); return !bound },
 		time.Second, 10*time.Millisecond)
-	assert.Nil(t, r.activeSession(testPair))
+	assert.True(t, r.activeSession(testPair) == nil)
 	_, err := rs.upstream.Write([]byte{1})
 	assert.True(t, isClosed(err), "upstream socket is closed, got %v", err)
 }
@@ -293,21 +293,92 @@ func TestRelayReapsIdleSessions(t *testing.T) {
 func TestRelayRefusesBindsBeyondMaxSessions(t *testing.T) {
 	bds := startBDS(t)
 	m := NewMetrics(prometheus.NewRegistry())
+	_, shared := sharedRedis(t)
 	opt := defaultOpts(m)
 	opt.MaxSessions = 1
-	r, relayAddr := startRelay(t, NewMemoryRegistry(), NewMemoryRegistry(), opt)
-	require.NoError(t, r.Register(t.Context(), testPair, session(bds)))
-	require.NoError(t, r.Register(t.Context(), "2c69:Abcd", session(bds)))
+	a, _ := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
+	b, bAddr := startRelay(t, NewMemoryRegistry(), shared, opt)
 
+	// Signal time: B holds one session, so B refuses a second.
+	require.NoError(t, b.Register(t.Context(), testPair, session(bds)))
+	assert.ErrorIs(t, b.Register(t.Context(), "2c69:Abcd", session(bds)), ErrSessionCap)
+
+	// Bind time: a pair signaled on A also counts once it binds on B.
+	const other = "2c69:Efgh"
+	require.NoError(t, a.Register(t.Context(), other, session(bds)))
 	first := newClient(t)
 	p1 := signedBinding(testPair, testPwd)
-	send(t, first, relayAddr, p1)
+	send(t, first, bAddr, p1)
 	bds.expect(t, p1)
 
 	second := newClient(t)
-	send(t, second, relayAddr, signedBinding("2c69:Abcd", testPwd))
+	for range 10 {
+		send(t, second, bAddr, signedBinding(other, testPwd))
+		time.Sleep(30 * time.Millisecond)
+	}
 	bds.expectNothing(t)
-	assert.Equal(t, 1.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("session_cap")))
+	assert.GreaterOrEqual(t, testutil.ToFloat64(m.UDPDropped.WithLabelValues("session_cap")), 1.0)
+}
+
+func TestRelayRefusesRegisterBeyondThePerServerCap(t *testing.T) {
+	opt := defaultOpts(nil)
+	opt.MaxSessionsPerServer = 1
+	r, _ := startRelay(t, NewMemoryRegistry(), nil, opt)
+	require.NoError(t, r.Register(t.Context(), "aaaa:0001", Session{ServerID: "srv-1", IcePwd: testPwd}))
+	assert.ErrorIs(t, r.Register(t.Context(), "aaaa:0002", Session{ServerID: "srv-1", IcePwd: testPwd}), ErrSessionCap)
+	assert.NoError(t, r.Register(t.Context(), "aaaa:0003", Session{ServerID: "srv-2", IcePwd: testPwd}))
+}
+
+func TestRelayReapsSessionsPastHardReap(t *testing.T) {
+	bds := startBDS(t)
+	opt := defaultOpts(nil)
+	opt.HardReap = 100 * time.Millisecond
+	r, relayAddr := startRelay(t, NewMemoryRegistry(), nil, opt)
+	require.NoError(t, r.Register(t.Context(), testPair, session(bds)))
+	require.NoError(t, r.Register(t.Context(), "2c69:Never", session(bds)))
+
+	c := newClient(t)
+	stunPkt := signedBinding(testPair, testPwd)
+	send(t, c, relayAddr, stunPkt)
+	bds.expect(t, stunPkt)
+	rs := r.activeSession(testPair)
+	require.NotNil(t, rs)
+
+	// The client stays busy, so only the hard reap can end the session.
+	deadline := time.Now().Add(time.Second)
+	for r.activeSession(testPair) != nil && time.Now().Before(deadline) {
+		send(t, c, relayAddr, dtlsData)
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.True(t, r.activeSession(testPair) == nil, "a busy session is reaped past HardReap")
+	assert.True(t, r.activeSession("2c69:Never") == nil, "a signaled session is reaped past HardReap")
+	_, err := rs.upstream.Write([]byte{1})
+	assert.True(t, isClosed(err), "upstream socket is closed, got %v", err)
+}
+
+func TestRelaySessionsGaugeTracksSignaledAndBound(t *testing.T) {
+	bds := startBDS(t)
+	m := NewMetrics(prometheus.NewRegistry())
+	opt := defaultOpts(m)
+	opt.HardReap = 300 * time.Millisecond
+	r, relayAddr := startRelay(t, NewMemoryRegistry(), nil, opt)
+	gauge := func(state string) float64 { return testutil.ToFloat64(m.Sessions.WithLabelValues("srv-1", state)) }
+
+	require.NoError(t, r.Register(t.Context(), testPair, session(bds)))
+	assert.Equal(t, 1.0, gauge("signaled"))
+	assert.Equal(t, 0.0, gauge("bound"))
+
+	for range 2 { // bind, then rebind from a new address
+		c := newClient(t)
+		p := signedBinding(testPair, testPwd)
+		send(t, c, relayAddr, p)
+		bds.expect(t, p)
+		assert.Equal(t, 0.0, gauge("signaled"))
+		assert.Equal(t, 1.0, gauge("bound"))
+	}
+
+	assert.Eventually(t, func() bool { return gauge("bound") == 0 }, 2*time.Second, 10*time.Millisecond, "reap")
+	assert.Equal(t, 0.0, gauge("signaled"))
 }
 
 func TestRelayRegisterSurvivesASharedRegistryOutage(t *testing.T) {

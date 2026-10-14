@@ -9,7 +9,7 @@ type Metrics struct {
 	SignalingRequests *prometheus.CounterVec // result
 	TLSHandshakes     *prometheus.CounterVec // outcome
 	WakeHolds         *prometheus.CounterVec // outcome
-	Sessions          *prometheus.GaugeVec   // state
+	Sessions          *prometheus.GaugeVec   // server, state (signaled, bound)
 	UDPDropped        *prometheus.CounterVec // reason
 	RegistryErrors    prometheus.Counter
 }
@@ -26,8 +26,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "nethernet_wake_holds_total", Help: "Signaling requests held for a wake, by outcome.",
 		}, []string{"outcome"}),
 		Sessions: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "nethernet_sessions", Help: "Relay sessions by state.",
-		}, []string{"state"}),
+			Name: "nethernet_sessions", Help: "Relay sessions by server and state (signaled, bound).",
+		}, []string{"server", "state"}),
 		UDPDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "nethernet_udp_dropped_total", Help: "UDP datagrams the relay dropped, by reason.",
 		}, []string{"reason"}),
@@ -51,8 +51,8 @@ func (m *Metrics) registryError() {
 	}
 }
 
-func (m *Metrics) activeSessions(n int) {
+func (m *Metrics) session(server, state string, delta float64) {
 	if m != nil {
-		m.Sessions.WithLabelValues("active").Set(float64(n))
+		m.Sessions.WithLabelValues(server, state).Add(delta)
 	}
 }

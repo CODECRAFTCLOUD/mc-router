@@ -15,7 +15,7 @@ func TestNewMetricsRegistersOnTheGivenRegistry(t *testing.T) {
 	m.SignalingRequests.WithLabelValues("ok").Inc()
 	m.TLSHandshakes.WithLabelValues("ok").Inc()
 	m.WakeHolds.WithLabelValues("ready").Inc()
-	m.Sessions.WithLabelValues("active").Set(1)
+	m.Sessions.WithLabelValues("srv-1", "bound").Set(1)
 	m.UDPDropped.WithLabelValues("unknown_peer").Inc()
 	m.RegistryErrors.Inc()
 
@@ -37,6 +37,6 @@ func TestNilMetricsIsANoOp(t *testing.T) {
 	assert.NotPanics(t, func() {
 		m.dropped("unknown_peer")
 		m.registryError()
-		m.activeSessions(3)
+		m.session("srv-1", "bound", 1)
 	})
 }
