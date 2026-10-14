@@ -72,16 +72,17 @@ func ParseSDP(sdp string) (SDPInfo, error) {
 	return info, nil
 }
 
-// PickRelayTarget returns the first host candidate that is IPv4, not loopback
-// and not link-local: BDS does not listen for UDP on loopback.
-func PickRelayTarget(cands []Candidate) (netip.AddrPort, error) {
+// PickRelayTarget returns the first host candidate whose address is pod, the
+// backend's endpoint IP, never loopback or link-local: an answer the backend
+// authors (Geyser runs owner plugins) can only aim the relay at its own pod.
+func PickRelayTarget(cands []Candidate, pod netip.Addr) (netip.AddrPort, error) {
 	for _, c := range cands {
 		a := c.Addr.Addr()
-		if c.Typ == "host" && a.Is4() && !a.IsLoopback() && !a.IsLinkLocalUnicast() && !a.IsUnspecified() && c.Addr.Port() != 0 {
+		if c.Typ == "host" && a == pod && !a.IsLoopback() && !a.IsLinkLocalUnicast() && !a.IsUnspecified() && c.Addr.Port() != 0 {
 			return c.Addr, nil
 		}
 	}
-	return netip.AddrPort{}, errors.New("sdp: no usable IPv4 host candidate")
+	return netip.AddrPort{}, fmt.Errorf("sdp: no usable host candidate at the pod address %s", pod)
 }
 
 // RewriteAnswer replaces every candidate with one host candidate at public and

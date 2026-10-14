@@ -50,22 +50,30 @@ func TestParseSDPReadsTheRealOffer(t *testing.T) {
 func TestPickRelayTargetSkipsLinkLocal(t *testing.T) {
 	info, err := ParseSDP(readGolden(t, "answer-bds-1.26.52.3.sdp"))
 	require.NoError(t, err)
-	target, err := PickRelayTarget(info.Candidates)
+	target, err := PickRelayTarget(info.Candidates, netip.MustParseAddr("10.0.0.3"))
 	require.NoError(t, err)
 	assert.Equal(t, netip.MustParseAddrPort("10.0.0.3:19140"), target)
 }
 
-func TestPickRelayTargetRejectsLoopbackOnly(t *testing.T) {
-	_, err := PickRelayTarget([]Candidate{{Addr: netip.MustParseAddrPort("127.0.0.1:19132"), Typ: "host"}})
+func TestPickRelayTargetRefusesACandidateThatIsNotThePod(t *testing.T) {
+	info, err := ParseSDP(readGolden(t, "answer-bds-1.26.52.3.sdp"))
+	require.NoError(t, err)
+	_, err = PickRelayTarget(info.Candidates, netip.MustParseAddr("10.9.9.9"))
 	assert.Error(t, err)
 }
 
-func TestPickRelayTargetSkipsNonHostAndIPv6(t *testing.T) {
+func TestPickRelayTargetRejectsLoopbackOnly(t *testing.T) {
+	_, err := PickRelayTarget([]Candidate{{Addr: netip.MustParseAddrPort("127.0.0.1:19132"), Typ: "host"}},
+		netip.MustParseAddr("127.0.0.1"))
+	assert.Error(t, err)
+}
+
+func TestPickRelayTargetSkipsNonHostCandidates(t *testing.T) {
 	target, err := PickRelayTarget([]Candidate{
-		{Addr: netip.MustParseAddrPort("10.0.0.9:1"), Typ: "srflx"},
+		{Addr: netip.MustParseAddrPort("10.0.0.4:1"), Typ: "srflx"},
 		{Addr: netip.MustParseAddrPort("[fd00::1]:2"), Typ: "host"},
 		{Addr: netip.MustParseAddrPort("10.0.0.4:3"), Typ: "host"},
-	})
+	}, netip.MustParseAddr("10.0.0.4"))
 	require.NoError(t, err)
 	assert.Equal(t, netip.MustParseAddrPort("10.0.0.4:3"), target)
 }
