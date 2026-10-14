@@ -82,7 +82,7 @@ func startRelay(t *testing.T, local, shared Registry, opt RelayOptions) (*Relay,
 }
 
 func defaultOpts(m *Metrics) RelayOptions {
-	return RelayOptions{UnboundTTL: time.Minute, IdleTimeout: time.Minute, MaxSessions: 100, MaxSessionsPerServer: 100, Metrics: m}
+	return RelayOptions{UnboundTTL: time.Minute, IdleTimeout: time.Minute, MaxSessions: 100, MaxSessionsPerServer: 100, MaxUnboundPerIP: 100, Metrics: m}
 }
 
 func newClient(t *testing.T) *net.UDPConn {
@@ -329,6 +329,26 @@ func TestRelayRefusesRegisterBeyondThePerServerCap(t *testing.T) {
 	assert.NoError(t, r.Register(t.Context(), "aaaa:0003", Session{ServerID: "srv-2", IcePwd: testPwd}))
 }
 
+func TestRelayRefusesUnboundSessionsBeyondThePerIPCap(t *testing.T) {
+	bds := startBDS(t)
+	opt := defaultOpts(nil)
+	opt.MaxUnboundPerIP = 2
+	r, relayAddr := startRelay(t, NewMemoryRegistry(), nil, opt)
+	ipA, ipB := netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("198.51.100.8")
+	from := func(ip netip.Addr) Session { s := session(bds); s.SignalIP = ip; return s }
+
+	require.NoError(t, r.Register(t.Context(), testPair, from(ipA)))
+	require.NoError(t, r.Register(t.Context(), "2c69:0002", from(ipA)))
+	assert.ErrorIs(t, r.Register(t.Context(), "2c69:0003", from(ipA)), ErrSessionCap, "the cap is hit")
+	assert.NoError(t, r.Register(t.Context(), "2c69:0004", from(ipB)), "another IP is unaffected")
+
+	c := newClient(t)
+	p := signedBinding(testPair, testPwd)
+	send(t, c, relayAddr, p)
+	bds.expect(t, p)
+	assert.NoError(t, r.Register(t.Context(), "2c69:0003", from(ipA)), "binding one frees a slot")
+}
+
 func TestRelayReapsSessionsPastHardReap(t *testing.T) {
 	bds := startBDS(t)
 	opt := defaultOpts(nil)
@@ -403,6 +423,7 @@ func TestNewRelayRejectsZeroTimeouts(t *testing.T) {
 		"IdleTimeout":          func(o *RelayOptions) { o.IdleTimeout = 0 },
 		"MaxSessions":          func(o *RelayOptions) { o.MaxSessions = 0 },
 		"MaxSessionsPerServer": func(o *RelayOptions) { o.MaxSessionsPerServer = -1 },
+		"MaxUnboundPerIP":      func(o *RelayOptions) { o.MaxUnboundPerIP = 0 },
 	} {
 		opt := defaultOpts(nil)
 		zero(&opt)
@@ -494,9 +515,10 @@ func TestRelayLooksUpOnlyDTLSShapedStrangersOncePerWindow(t *testing.T) {
 	assert.Equal(t, int32(1), shared.lookups.Load(), "repeated junk from one address costs one lookup")
 }
 
-func TestRelayMovesABoundAddressToANewPairOnAVerifiedCheck(t *testing.T) {
+func TestRelayKeepsABoundAddressOnACheckForAnotherPair(t *testing.T) {
 	bds1, bds2 := startBDS(t), startBDS(t)
-	r, relayAddr := startRelay(t, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(nil))
+	m := NewMetrics(prometheus.NewRegistry())
+	r, relayAddr := startRelay(t, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(m))
 	const pair2 = "9f3a:QXyz"
 	require.NoError(t, r.Register(t.Context(), testPair, session(bds1)))
 	require.NoError(t, r.Register(t.Context(), pair2, Session{ServerID: "srv-2", Target: bds2.addr, IcePwd: testPwd}))
@@ -507,15 +529,20 @@ func TestRelayMovesABoundAddressToANewPairOnAVerifiedCheck(t *testing.T) {
 	bds1.expect(t, first)
 	expectReply(t, c, relayAddr, first)
 
-	// The same ip:port starts a new join (port-preserving NAT, a quick server switch).
-	second := signedBinding(pair2, testPwd)
-	send(t, c, relayAddr, second)
-	bds2.expect(t, second)
-	expectReply(t, c, relayAddr, second)
+	// A correctly signed check for another pair from the bound address (a spoofed
+	// takeover, or a reused ip:port) must not move the address.
+	send(t, c, relayAddr, signedBinding(pair2, testPwd))
+	bds2.expectNothing(t)
 	bds1.expectNothing(t)
+	assert.Equal(t, 1.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("pair_mismatch")))
+
+	send(t, c, relayAddr, dtlsData)
+	bds1.expect(t, dtlsData)
 	pair, bound := r.boundPair(clientAddr(c))
 	assert.True(t, bound)
-	assert.Equal(t, pair2, pair)
+	assert.Equal(t, testPair, pair)
+	rs2 := r.activeSession(pair2)
+	assert.True(t, rs2 != nil && rs2.upstream == nil, "the other pair stays signaled, not bound")
 }
 
 func TestRelayRebindDeletesTheOldClientKey(t *testing.T) {
