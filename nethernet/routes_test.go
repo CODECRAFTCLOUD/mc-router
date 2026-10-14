@@ -91,3 +91,46 @@ func TestRemoveLeavesAHostAnotherServiceTookOver(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "b", b.ServerID)
 }
+
+// M-2: a leaked Service can claim a live server's host or pool port. Every
+// replica must pick the same winner (the lowest svcKey), whatever the event
+// order, and a slice event re-running Upsert must not flip it.
+func TestRouteTableTwoClaimsPickTheSameWinnerInAnyOrder(t *testing.T) {
+	for _, order := range [][]string{{"game/mc-a", "game/mc-b"}, {"game/mc-b", "game/mc-a"}} {
+		rt := NewRouteTable()
+		for _, key := range order {
+			rt.Upsert(key, []string{"shared.uniz.host"}, b1Backend(key, 30001))
+		}
+		rt.Upsert("game/mc-b", []string{"shared.uniz.host"}, b1Backend("game/mc-b", 30001)) // a slice event
+
+		b, ok := rt.ByHost("shared.uniz.host")
+		require.True(t, ok, order)
+		assert.Equal(t, "game/mc-a", b.ServerID, order)
+		b, ok = rt.ByLegacyPort(30001)
+		require.True(t, ok, order)
+		assert.Equal(t, "game/mc-a", b.ServerID, order)
+	}
+}
+
+func TestRouteTableFallsBackWhenTheWinnerIsRemoved(t *testing.T) {
+	for _, order := range [][]string{{"game/mc-a", "game/mc-b"}, {"game/mc-b", "game/mc-a"}} {
+		rt := NewRouteTable()
+		for _, key := range order {
+			rt.Upsert(key, []string{"shared.uniz.host"}, b1Backend(key, 30001))
+		}
+		rt.Remove("game/mc-a")
+
+		b, ok := rt.ByHost("shared.uniz.host")
+		require.True(t, ok, order)
+		assert.Equal(t, "game/mc-b", b.ServerID, order, "the next claimant takes over")
+		b, ok = rt.ByLegacyPort(30001)
+		require.True(t, ok, order)
+		assert.Equal(t, "game/mc-b", b.ServerID, order)
+
+		rt.Remove("game/mc-b")
+		_, ok = rt.ByHost("shared.uniz.host")
+		assert.False(t, ok, order)
+		_, ok = rt.ByLegacyPort(30001)
+		assert.False(t, ok, order)
+	}
+}
