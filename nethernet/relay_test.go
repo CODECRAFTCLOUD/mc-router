@@ -767,3 +767,18 @@ func TestRelayDropsAnOversizedUsernameWithoutALookup(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, int32(0), local.gets.Load()+shared.gets.Load(), "an oversized USERNAME is never a lookup key")
 }
+
+func TestRelayCountsAFullQueueAsAQueueFullDrop(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer conn.Close()
+	m := NewMetrics(prometheus.NewRegistry())
+	r, err := NewRelay(conn, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(m))
+	require.NoError(t, err)
+	for range sharedQueue { // no Serve, so nothing drains the queue
+		r.jobs <- func(context.Context) {}
+	}
+	r.queuePublish(&relaySession{pair: testPair})
+	assert.Equal(t, 1.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("queue_full")))
+	assert.Equal(t, 0.0, testutil.ToFloat64(m.RegistryErrors), "a full queue is not a registry error")
+}

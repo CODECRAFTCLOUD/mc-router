@@ -396,7 +396,7 @@ func (r *Relay) queuePublish(rs *relaySession) {
 		rs.publishing = true
 	default: // queue full: the next forwarded datagram retries
 		rs.lastShared.Store(0)
-		r.opt.Metrics.registryError()
+		r.opt.Metrics.dropped("queue_full")
 	}
 }
 
