@@ -15,10 +15,12 @@ import (
 // registryTimeout bounds every shared-registry call so a slow Dragonfly never stalls the packet path.
 const registryTimeout = 250 * time.Millisecond
 
+// RelayOptions bound every session: UnboundTTL for a signaled session that never
+// binds, IdleTimeout without client traffic, HardReap for any session (0 = off).
 type RelayOptions struct {
-	UnboundTTL, IdleTimeout time.Duration
-	MaxSessions             int
-	Metrics                 *Metrics
+	UnboundTTL, IdleTimeout, HardReap time.Duration
+	MaxSessions, MaxSessionsPerServer int
+	Metrics                           *Metrics
 }
 
 // relaySession is a bound session: one upstream socket to BDS and the client
@@ -45,10 +47,14 @@ type Relay struct {
 	byPair   map[string]*relaySession
 }
 
-// NewRelay builds a relay on conn. shared may be nil (single replica).
-func NewRelay(conn *net.UDPConn, local Registry, shared Registry, opt RelayOptions) *Relay {
+// NewRelay builds a relay on conn. shared may be nil (single replica). A zero
+// timeout or cap is refused: it would make every join fail or never reap.
+func NewRelay(conn *net.UDPConn, local Registry, shared Registry, opt RelayOptions) (*Relay, error) {
+	if opt.UnboundTTL <= 0 || opt.IdleTimeout <= 0 || opt.HardReap < 0 || opt.MaxSessions <= 0 || opt.MaxSessionsPerServer <= 0 {
+		return nil, errors.New("nethernet relay: UnboundTTL, IdleTimeout, MaxSessions and MaxSessionsPerServer must be > 0, HardReap >= 0")
+	}
 	return &Relay{conn: conn, local: local, shared: shared, opt: opt,
-		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{}}
+		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{}}, nil
 }
 
 // Register records a signaled session locally and in the shared registry. A
@@ -72,9 +78,7 @@ func (r *Relay) Serve(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() { _ = r.conn.SetReadDeadline(time.Now()) })
 	defer stop()
 	defer r.closeAll()
-	if r.opt.IdleTimeout > 0 {
-		go r.reapLoop(ctx)
-	}
+	go r.reapLoop(ctx)
 	buf := make([]byte, 64*1024)
 	for {
 		n, from, err := r.conn.ReadFromUDPAddrPort(buf)
@@ -198,7 +202,7 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 		r.byClient[client] = rs
 		return rs, ""
 	}
-	if r.opt.MaxSessions > 0 && len(r.byPair) >= r.opt.MaxSessions {
+	if len(r.byPair) >= r.opt.MaxSessions {
 		return nil, "session_cap"
 	}
 	up, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(s.Target))
@@ -242,7 +246,7 @@ func (r *Relay) publishBinding(ctx context.Context, client netip.AddrPort, rs *r
 func (r *Relay) forward(ctx context.Context, from netip.AddrPort, rs *relaySession, pkt []byte) {
 	now := time.Now().UnixNano()
 	rs.lastSeen.Store(now)
-	if r.opt.IdleTimeout > 0 && now-rs.lastShared.Load() >= int64(r.opt.IdleTimeout/2) {
+	if now-rs.lastShared.Load() >= int64(r.opt.IdleTimeout/2) {
 		r.publishBinding(ctx, from, rs)
 	}
 	if _, err := rs.upstream.Write(pkt); err != nil {
@@ -273,7 +277,7 @@ func (r *Relay) pipeUpstream(rs *relaySession) {
 // reapLoop drops sessions with no client datagram for IdleTimeout. Only client
 // traffic counts: a live client sends ICE consent checks on its own.
 func (r *Relay) reapLoop(ctx context.Context) {
-	t := time.NewTicker(r.opt.IdleTimeout / 2)
+	t := time.NewTicker(max(r.opt.IdleTimeout/2, time.Millisecond))
 	defer t.Stop()
 	for {
 		select {

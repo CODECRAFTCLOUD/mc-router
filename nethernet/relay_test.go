@@ -70,7 +70,8 @@ func startRelay(t *testing.T, local, shared Registry, opt RelayOptions) (*Relay,
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
-	r := NewRelay(conn, local, shared, opt)
+	r, err := NewRelay(conn, local, shared, opt)
+	require.NoError(t, err)
 	done := make(chan struct{})
 	go func() { _ = r.Serve(ctx); close(done) }()
 	t.Cleanup(func() { cancel(); <-done; _ = conn.Close() })
@@ -78,7 +79,7 @@ func startRelay(t *testing.T, local, shared Registry, opt RelayOptions) (*Relay,
 }
 
 func defaultOpts(m *Metrics) RelayOptions {
-	return RelayOptions{UnboundTTL: time.Minute, IdleTimeout: time.Minute, MaxSessions: 100, Metrics: m}
+	return RelayOptions{UnboundTTL: time.Minute, IdleTimeout: time.Minute, MaxSessions: 100, MaxSessionsPerServer: 100, Metrics: m}
 }
 
 func newClient(t *testing.T) *net.UDPConn {
@@ -291,4 +292,25 @@ func TestRelayRegisterSurvivesASharedRegistryOutage(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, 1.0, testutil.ToFloat64(m.RegistryErrors))
+}
+
+func TestNewRelayRejectsZeroTimeouts(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer conn.Close()
+	for name, zero := range map[string]func(*RelayOptions){
+		"UnboundTTL":           func(o *RelayOptions) { o.UnboundTTL = 0 },
+		"IdleTimeout":          func(o *RelayOptions) { o.IdleTimeout = 0 },
+		"MaxSessions":          func(o *RelayOptions) { o.MaxSessions = 0 },
+		"MaxSessionsPerServer": func(o *RelayOptions) { o.MaxSessionsPerServer = -1 },
+	} {
+		opt := defaultOpts(nil)
+		zero(&opt)
+		_, err := NewRelay(conn, NewMemoryRegistry(), nil, opt)
+		assert.Error(t, err, name)
+	}
+	opt := defaultOpts(nil)
+	opt.HardReap = 0 // off
+	_, err = NewRelay(conn, NewMemoryRegistry(), nil, opt)
+	assert.NoError(t, err)
 }
