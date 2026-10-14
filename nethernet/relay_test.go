@@ -2,6 +2,7 @@ package nethernet
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
@@ -579,10 +580,15 @@ func TestRelayReadLoopNeverWaitsOnASlowSharedRegistry(t *testing.T) {
 	}
 }
 
-// countingRegistry counts shared lookups of client addresses.
+// countingRegistry counts lookups of client addresses and of sessions.
 type countingRegistry struct {
 	Registry
-	lookups atomic.Int32
+	lookups, gets atomic.Int32
+}
+
+func (c *countingRegistry) GetSession(ctx context.Context, pair string) (Session, bool, error) {
+	c.gets.Add(1)
+	return c.Registry.GetSession(ctx, pair)
 }
 
 func (c *countingRegistry) LookupClient(ctx context.Context, client netip.AddrPort) (string, bool, error) {
@@ -729,4 +735,35 @@ func TestRelayServeLeavesNoGoroutinesWhenItsSocketCloses(t *testing.T) {
 		t.Fatal("Serve did not return")
 	}
 	assert.True(t, settled(before), "workers and reaper exit with Serve: %d goroutines, %d before", runtime.NumGoroutine(), before)
+}
+
+// bindingWithUsername is an unsigned STUN binding request whose USERNAME is n bytes.
+func bindingWithUsername(n int) []byte {
+	attr := (4 + n + 3) &^ 3
+	pkt := make([]byte, 20+attr)
+	binary.BigEndian.PutUint16(pkt[0:], 0x0001)
+	binary.BigEndian.PutUint16(pkt[2:], uint16(attr))
+	binary.BigEndian.PutUint32(pkt[4:], stunMagicCookie)
+	binary.BigEndian.PutUint16(pkt[20:], stunAttrUsername)
+	binary.BigEndian.PutUint16(pkt[22:], uint16(n))
+	for i := range n {
+		pkt[24+i] = 'a'
+	}
+	return pkt
+}
+
+func TestRelayDropsAnOversizedUsernameWithoutALookup(t *testing.T) {
+	m := NewMetrics(prometheus.NewRegistry())
+	local, shared := &countingRegistry{Registry: NewMemoryRegistry()}, &countingRegistry{Registry: NewMemoryRegistry()}
+	_, relayAddr := startRelay(t, local, shared, defaultOpts(m))
+	pkt := bindingWithUsername(514)
+	u, ok := STUNUsername(pkt)
+	require.True(t, ok)
+	require.Len(t, u, 514)
+
+	send(t, newClient(t), relayAddr, pkt)
+	assert.Eventually(t, func() bool { return testutil.ToFloat64(m.UDPDropped.WithLabelValues("bad_username")) == 1 },
+		time.Second, 10*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int32(0), local.gets.Load()+shared.gets.Load(), "an oversized USERNAME is never a lookup key")
 }

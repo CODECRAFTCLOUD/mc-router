@@ -23,6 +23,8 @@ const (
 	// negative cache), and at most maxLookupKeys distinct keys per window.
 	lookupWindow  = time.Second
 	maxLookupKeys = 4096
+	// A longer STUN USERNAME is dropped (RFC 5389 section 15.3 keeps it under 513 bytes).
+	maxUsername = 513
 )
 
 // ErrSessionCap is Register's answer when the replica or the server holds its
@@ -197,6 +199,10 @@ func (r *Relay) bindFromSTUN(ctx context.Context, from netip.AddrPort, pkt []byt
 	pair, ok := STUNUsername(pkt)
 	if !ok {
 		r.opt.Metrics.dropped("unknown_peer")
+		return
+	}
+	if len(pair) > maxUsername { // never a lookup key: it would bloat the de-dup sets
+		r.opt.Metrics.dropped("bad_username")
 		return
 	}
 	s, ok := r.knownSession(ctx, pair)
