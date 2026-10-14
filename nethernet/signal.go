@@ -32,6 +32,9 @@ const (
 	pollEvery      = 500 * time.Millisecond
 	maxHeaderBytes = 64 << 10
 	maxTLSRecord   = 16 << 10 // a ClientHello is read as one TLS record
+	// maxAnswerForwards bounds the forwards of one offer while BDS's answer has
+	// no candidate at the pod address (the first included).
+	maxAnswerForwards = 5
 )
 
 // tlsHandshakeFailure is the fatal handshake_failure alert BDS sends to a TLS
@@ -91,11 +94,14 @@ type SignalServer struct {
 	backoff wakeBackoffCache
 	hc      *http.Client
 	now     func() time.Time // for the rate limits; tests freeze it
+	// answerRetry is the wait before the offer is forwarded again when the
+	// answer has no candidate at the pod address; tests shorten it.
+	answerRetry time.Duration
 }
 
 func NewSignalServer(o SignalOptions) *SignalServer {
 	s := &SignalServer{o: o, limiter: newConnRateLimiter(o.GlobalRate, o.PerIPRate), legacy: newConnRateLimiter(o.LegacyRate, 0),
-		wakes: newWakeLimiter(o.WakesPerPlayer, o.WakeWindow), backoff: wakeBackoffCache{ttl: o.WakeBackoff, byPort: map[int]cachedWake{}}, now: time.Now}
+		wakes: newWakeLimiter(o.WakesPerPlayer, o.WakeWindow), backoff: wakeBackoffCache{ttl: o.WakeBackoff, byPort: map[int]cachedWake{}}, now: time.Now, answerRetry: time.Second}
 	s.getCert = o.GetCertificate
 	if s.getCert == nil && o.TLSCert != nil {
 		s.getCert = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return o.TLSCert, nil }
@@ -483,56 +489,91 @@ func (j *join) wake(ctx context.Context, req *http.Request, offer []byte, b Back
 // answer forwards the offer, registers the session with the relay and returns
 // the answer rewritten to the one public candidate. Any failure after the
 // forward is a 502: the unrewritten answer never leaves the router.
+//
+// A BDS that has just started opens its signaling port before its NetherNet
+// transport can name its own pod address, so an answer without a candidate at
+// the pod is retried: the same offer is forwarded again answerRetry later, at
+// most maxAnswerForwards times in all, and only while the join is within
+// WakeHold of the accept and the client is still there. BDS treats each
+// forward as a new attempt and abandons the unanswered one.
 func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 	s := j.s
-	b, ok := s.route(req.Host, j.localPort)
-	if !ok {
-		j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
-		return
-	}
-	resp, answer, err := s.forward(ctx, b, req, offer)
-	if err != nil {
-		logrus.WithError(err).WithField("serverId", b.ServerID).Debug("nethernet: offer forward failed")
-		j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
-		return
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 { // BDS's own refusal: its status, never its body
-		j.reply(resp.StatusCode, nil, nil, "backend_status")
-		return
-	}
-	fail := func(why string, err error) {
+	fail := func(b Backend, why string, err error) {
 		logrus.WithError(err).WithField("serverId", b.ServerID).Warn("nethernet: answer refused: " + why)
 		j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
 	}
-	off, err := ParseSDP(string(offer))
-	if err != nil {
-		fail("offer", err)
-		return
-	}
-	ans, err := ParseSDP(string(answer))
-	if err != nil {
-		fail("answer", err)
-		return
-	}
-	// PodIPs as of the answer, but only of the Service that answered: a route
-	// that moved to another Service meanwhile must not lend it its pods.
-	if fresh, ok := s.route(req.Host, j.localPort); ok && fresh.Addr == b.Addr {
-		b = fresh
-	}
-	var target netip.AddrPort
-	for _, ip := range b.PodIPs { // R25: the relay target is the backend's own pod, whatever the answer says
-		if t, err := PickRelayTarget(ans.Candidates, ip); err == nil {
-			target = t
+	retry, cancel := context.WithDeadline(ctx, j.start.Add(s.o.WakeHold))
+	defer cancel()
+	var (
+		b      Backend
+		resp   *http.Response
+		answer []byte
+		ans    SDPInfo
+		target netip.AddrPort
+	)
+	for forwards := 1; ; forwards++ {
+		var ok bool
+		if b, ok = s.route(req.Host, j.localPort); !ok { // re-read each time: the route may have moved
+			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
+			return
+		}
+		fctx := ctx // the first forward keeps its own timeout, as before retries existed
+		if forwards > 1 {
+			fctx = retry
+		}
+		var err error
+		resp, answer, err = s.forward(fctx, b, req, offer)
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{"serverId": b.ServerID, "forwards": forwards}).Debug("nethernet: offer forward failed")
+			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
+			return
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 { // BDS's own refusal: its status, never its body
+			j.reply(resp.StatusCode, nil, nil, "backend_status")
+			return
+		}
+		if ans, err = ParseSDP(string(answer)); err != nil {
+			fail(b, "answer", err)
+			return
+		}
+		// PodIPs as of the answer, but only of the Service that answered: a route
+		// that moved to another Service meanwhile must not lend it its pods.
+		if fresh, ok := s.route(req.Host, j.localPort); ok && fresh.Addr == b.Addr {
+			b = fresh
+		}
+		target = netip.AddrPort{}
+		for _, ip := range b.PodIPs { // R25: the relay target is the backend's own pod, whatever the answer says
+			if t, err := PickRelayTarget(ans.Candidates, ip); err == nil {
+				target = t
+				break
+			}
+		}
+		if target.IsValid() {
+			if forwards > 1 {
+				s.o.Metrics.answerRetry("recovered")
+			}
 			break
 		}
+		if forwards == maxAnswerForwards || !s.waitToRetry(retry) {
+			if ctx.Err() == nil { // a hang-up is not a failed retry
+				s.o.Metrics.answerRetry("exhausted")
+			}
+			cands := make([]netip.Addr, 0, len(ans.Candidates)) // IPs only: no ports, no ufrag
+			for _, c := range ans.Candidates {
+				cands = append(cands, c.Addr.Addr())
+			}
+			fail(b, "no candidate at the pod address", fmt.Errorf("pods %v, answer candidates %v, forwards %d", b.PodIPs, cands, forwards))
+			return
+		}
 	}
-	if !target.IsValid() {
-		fail("no candidate at the pod address", fmt.Errorf("pods %v", b.PodIPs))
+	off, err := ParseSDP(string(offer))
+	if err != nil {
+		fail(b, "offer", err)
 		return
 	}
 	rewritten, err := RewriteAnswer(string(answer), s.o.PublicAddr)
 	if err != nil {
-		fail("rewrite", err)
+		fail(b, "rewrite", err)
 		return
 	}
 	err = s.o.Relay.Register(ctx, ans.IceUfrag+":"+off.IceUfrag, Session{
@@ -543,10 +584,26 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		return
 	}
 	if err != nil {
-		fail("register", err)
+		fail(b, "register", err)
 		return
 	}
 	j.reply(http.StatusOK, resp.Header, []byte(rewritten), "answered")
+}
+
+// waitToRetry waits answerRetry before another forward, and reports false when
+// retry (the client, or the join's WakeHold) would end before that forward.
+func (s *SignalServer) waitToRetry(retry context.Context) bool {
+	if dl, ok := retry.Deadline(); ok && time.Until(dl) <= s.answerRetry {
+		return false
+	}
+	t := time.NewTimer(s.answerRetry)
+	defer t.Stop()
+	select {
+	case <-retry.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // forward sends the request to the backend's signaling port as plain HTTP

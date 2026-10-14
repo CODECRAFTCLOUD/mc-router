@@ -15,6 +15,7 @@ type Metrics struct {
 	RegistryQueueFull prometheus.Counter
 	LookupsDropped    *prometheus.CounterVec // kind (s, c)
 	Renominations     *prometheus.CounterVec // outcome (sent, confirmed)
+	AnswerRetries     *prometheus.CounterVec // outcome (recovered, exhausted)
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -49,8 +50,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "nethernet_renominations_total",
 			Help: "Client checks of an adopted session forwarded with USE-CANDIDATE added (sent), and server success responses that ended a session's re-nomination (confirmed).",
 		}, []string{"outcome"}),
+		AnswerRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "nethernet_answer_retries_total",
+			Help: "Joins whose answer had no candidate at the pod address, by how the re-forwards of the offer ended: an answer that named the pod (recovered), or a 502 (exhausted).",
+		}, []string{"outcome"}),
 	}
-	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors, m.RegistryQueueFull, m.LookupsDropped, m.Renominations)
+	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors, m.RegistryQueueFull, m.LookupsDropped, m.Renominations, m.AnswerRetries)
 	return m
 }
 
@@ -105,5 +110,11 @@ func (m *Metrics) wakeHold(outcome string) {
 func (m *Metrics) renomination(outcome string) {
 	if m != nil {
 		m.Renominations.WithLabelValues(outcome).Inc()
+	}
+}
+
+func (m *Metrics) answerRetry(outcome string) {
+	if m != nil {
+		m.AnswerRetries.WithLabelValues(outcome).Inc()
 	}
 }

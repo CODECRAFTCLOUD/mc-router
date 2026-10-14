@@ -1263,3 +1263,96 @@ func TestSignalAndAnAdoptingRelayNominateTheNewPath(t *testing.T) {
 	got := sendUntilBDS(t, newClient(t), bAddr, controllingBinding(pair, ans.IcePwd), bds)
 	assertNominates(t, got, ans.IcePwd)
 }
+
+// noPodAnswer is the golden answer with its pod candidate moved off the pod
+// address and its own server ufrag: BDS's answer while its NetherNet transport
+// is still starting (prod, Gate 1, 2026-10-15).
+func noPodAnswer(t *testing.T, n int32) string {
+	golden := readGolden(t, "answer-bds-1.26.52.3.sdp")
+	golden = strings.Replace(golden, "10.0.0.3 19140", "10.0.0.77 19140", 1)
+	return strings.Replace(golden, "a=ice-ufrag:2c69", fmt.Sprintf("a=ice-ufrag:%04d", n), 1)
+}
+
+func fastRetry(d time.Duration) func(*SignalServer) {
+	return func(s *SignalServer) { s.answerRetry = d }
+}
+
+func TestSignalRetriesTheOfferUntilTheAnswerNamesThePod(t *testing.T) {
+	f := newSigFixture(t)
+	golden := readGolden(t, "answer-bds-1.26.52.3.sdp")
+	var offers []string
+	f.backend.setAnswer(func(n int32) string {
+		_, got := f.backend.last()
+		offers = append(offers, got)
+		if n <= 2 {
+			return noPodAnswer(t, n)
+		}
+		return strings.Replace(golden, "a=ice-ufrag:2c69", fmt.Sprintf("a=ice-ufrag:%04d", n), 1)
+	})
+	addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+	offer := f.validOffer(t)
+	resp, body := sigDo(t, addr, sigReq{body: offer})
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, []string{"a=candidate:1 1 udp 2122260223 82.26.104.95 19132 typ host generation 0"}, candidates(body))
+	assert.Contains(t, body, "a=ice-ufrag:0003", "the client gets the answer that named the pod")
+	assert.Equal(t, int32(3), f.backend.posts.Load())
+	require.Len(t, offers, 3)
+	for i, o := range offers {
+		assert.True(t, o == offer, "forward %d carries the same offer", i+1)
+	}
+	assert.Nil(t, f.relay.activeSession("0001:QXyz"))
+	assert.Nil(t, f.relay.activeSession("0002:QXyz"))
+	rs := f.relay.activeSession("0003:QXyz")
+	require.NotNil(t, rs, "the relay registers the final answer's pair only")
+	assert.Equal(t, netip.MustParseAddrPort(sigTarget), rs.s.Target)
+	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("recovered")))
+	assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
+}
+
+func TestSignalGivesUpOnAnAnswerThatNeverNamesThePod(t *testing.T) {
+	t.Run("after five forwards", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.backend.setAnswer(func(n int32) string { return noPodAnswer(t, n) })
+		addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+		resp, body := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+		assert.NotContains(t, body, "a=candidate")
+		assert.Equal(t, int32(5), f.backend.posts.Load())
+		for n := 1; n <= 5; n++ {
+			assert.Nil(t, f.relay.activeSession(fmt.Sprintf("%04d:QXyz", n)))
+		}
+		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("recovered")))
+	})
+	t.Run("when the join's time runs out first", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.opts.WakeHold = 500 * time.Millisecond
+		f.backend.setAnswer(func(n int32) string { return noPodAnswer(t, n) })
+		addr := f.serve(t, 19132, fastRetry(200*time.Millisecond))
+		start := time.Now()
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+		assert.Less(t, time.Since(start), 700*time.Millisecond, "no retry past WakeHold from the accept")
+		assert.Less(t, f.backend.posts.Load(), int32(5))
+		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
+	})
+}
+
+func TestSignalStopsRetryingWhenTheClientHangsUp(t *testing.T) {
+	f := newSigFixture(t)
+	f.opts.WakeHold = 10 * time.Second
+	f.backend.setAnswer(func(n int32) string { return noPodAnswer(t, n) })
+	addr := f.serve(t, 19132, fastRetry(300*time.Millisecond))
+	sigDo(t, addr, sigReq{body: f.validOffer(t), closeAfter: 100 * time.Millisecond})
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(f.metrics.SignalingRequests.WithLabelValues("http", "bad_gateway")) == 1
+	}, 2*time.Second, 10*time.Millisecond)
+	posts := f.backend.posts.Load()
+	time.Sleep(700 * time.Millisecond)
+	assert.Equal(t, int32(1), posts, "the hang-up ends the wait before the next forward")
+	assert.Equal(t, posts, f.backend.posts.Load(), "no forward after the hang-up")
+	assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")), "a hang-up is not a failed retry")
+}
