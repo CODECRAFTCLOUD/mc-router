@@ -581,6 +581,36 @@ func TestSignalLimitsWakesPerPlayer(t *testing.T) {
 	assert.Equal(t, 8, f.waker.count(), "another player still wakes")
 }
 
+// Spec §6.7: identity is verified before the back-off is read. A port primed
+// with a cached answer still refuses a bad identity with 403, holds nothing
+// and calls nothing.
+func TestSignalVerifiesIdentityBeforeTheBackOff(t *testing.T) {
+	for name, primed := range map[string]WakeResult{"booting": {Booting: true}, "refusal": {Message: "no credit"}} {
+		t.Run(name, func(t *testing.T) {
+			f := newSigFixture(t)
+			f.opts.WakeHold = 200 * time.Millisecond // never ready
+			f.asleep()
+			f.waker.result = func(int) (WakeResult, error) { return primed, nil }
+			addr := f.serve(t, 19132, func(s *SignalServer) { at := time.Now(); s.now = func() time.Time { return at } })
+			resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+			require.NotNil(t, resp)
+			require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, "the verified join primes the port")
+			require.Equal(t, 1, f.waker.count())
+			holds := testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout"))
+
+			junk := identLineRE.ReplaceAllString(f.validOffer(t), "a=identity:bm90LWEtdG9rZW4=\r")
+			start := time.Now()
+			resp, _ = sigDo(t, addr, sigReq{body: junk})
+			require.NotNil(t, resp)
+			assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+			assert.Less(t, time.Since(start), 150*time.Millisecond, "not held")
+			assert.Equal(t, 1, f.waker.count(), "no API call")
+			assert.Equal(t, holds, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")), "no hold")
+			assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("identity_rejected")))
+		})
+	}
+}
+
 // Ruling M-5: after a wake call for a legacy port answers booting or a
 // refusal, the API is not called for that port again for 5 s, so one lifted
 // identity assertion cannot drive a wake-API call per join.
