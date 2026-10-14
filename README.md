@@ -949,7 +949,7 @@ Every flag can also be set by its `NETHERNET_<NAME>` environment variable (the p
 | `-signal-rate-global` | `NETHERNET_SIGNAL_RATE_GLOBAL` | `200` | Signaling connections per second in all, bursting to 2x. `0` disables. |
 | `-max-body` | `NETHERNET_MAX_BODY` | `1048576` | Largest signaling request body, and largest backend answer, in bytes. |
 | `-request-timeout` | `NETHERNET_REQUEST_TIMEOUT` | `5s` | Time from the accept to a fully read signaling request: PROXY header, TLS handshake, headers and body. |
-| `-wake-limit-per-player` | `NETHERNET_WAKE_LIMIT_PER_PLAYER` | `5` | Actual wakes one verified player may cause per `-wake-limit-window` on this replica. A booting or refused answer from the API does not count; a failed or cut-short call does, because the API may still have woken the server. |
+| `-wake-limit-per-player` | `NETHERNET_WAKE_LIMIT_PER_PLAYER` | `5` | Wake calls one verified player may cause per `-wake-limit-window` on this replica. Every call counts except a clear not-woken answer (booting or refused) and a dial failure, which never reached the API. A timeout, a non-200 or a cut-short call counts, because the API may still have woken the server. |
 | `-wake-limit-window` | `NETHERNET_WAKE_LIMIT_WINDOW` | `1h` | Rolling window of `-wake-limit-per-player`. |
 | `-wake-backoff` | `NETHERNET_WAKE_BACKOFF` | `5s` | After the API answers "booting" or refuses a port's wake, that answer is reused this long instead of calling the API again. A failed call (network error, timeout, non-200) is not reused. |
 | `-metrics-binding` | `NETHERNET_METRICS_BINDING` | `:8080` | `host:port` that serves `/metrics` and `/healthz` only. |

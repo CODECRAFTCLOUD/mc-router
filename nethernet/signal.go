@@ -63,9 +63,10 @@ type SignalOptions struct {
 	// PerIPRate (bursts to 4x) applies to a player's own address only; GlobalRate
 	// (bursts to 2x) to every connection. Per second; 0 disables a tier.
 	PerIPRate, GlobalRate int
-	// Ruling R34: one verified player causes at most WakesPerPlayer actual
-	// wakes per rolling WakeWindow on this replica; a lifted identity
-	// assertion can wake, never join.
+	// Ruling R34: one verified player makes at most WakesPerPlayer wake calls
+	// per rolling WakeWindow on this replica. Every call counts except a clear
+	// not-woken answer and a dial failure (Rulings C-1, C-6); a lifted
+	// identity assertion can wake, never join.
 	WakesPerPlayer int
 	WakeWindow     time.Duration
 	// Ruling M-5: how long the API's booting or refused answer for a legacy
@@ -581,7 +582,8 @@ func newWakeLimiter(limit int, window time.Duration) *wakeLimiter {
 	return &wakeLimiter{limit: limit, window: window, byXUID: map[string][]time.Time{}}
 }
 
-// wakeLimiter counts each player's actual wakes over the last window.
+// wakeLimiter counts each player's wake calls over the last window, less
+// those handed back: a clear not-woken answer or a dial failure.
 type wakeLimiter struct {
 	limit     int
 	window    time.Duration

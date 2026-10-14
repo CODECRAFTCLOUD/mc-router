@@ -68,7 +68,7 @@ type Config struct {
 	SignalRateGlobal          int           `default:"200" usage:"Signaling connections per second in all, bursting to 2x; 0 disables"`
 	MaxBody                   int64         `default:"1048576" usage:"Largest signaling request or backend answer body, in bytes"`
 	RequestTimeout            time.Duration `default:"5s" usage:"Time from accept to a fully read signaling request: PROXY header, TLS handshake, headers and body"`
-	WakeLimitPerPlayer        int           `default:"5" usage:"Actual wakes one verified player may cause per --wake-limit-window on this replica"`
+	WakeLimitPerPlayer        int           `default:"5" usage:"Wake calls one verified player may cause per --wake-limit-window on this replica. Every call counts except a clear not-woken answer (booting or refused) and a dial failure, which never reached the API"`
 	WakeLimitWindow           time.Duration `default:"1h" usage:"Rolling window of --wake-limit-per-player"`
 	WakeBackoff               time.Duration `default:"5s" usage:"After the API answers booting or refuses a port's wake, reuse that answer this long instead of calling it again"`
 	MetricsBinding            string        `default:":8080" usage:"host:port serving /metrics and /healthz only"`
