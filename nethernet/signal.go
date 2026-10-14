@@ -135,7 +135,7 @@ func (s *SignalServer) ServeConn(ctx context.Context, conn net.Conn, localPort i
 		limiter = s.legacy
 	}
 	if ok, scope, logIt, suppressed := limiter.allow(perIP, s.now()); !ok {
-		s.o.Metrics.signal("", "rate_limited") // no byte read yet: the transport is unknown
+		s.o.Metrics.signal("", "rate_limited") // TLS or HTTP not read yet (a trusted proxy's PROXY header may have been): the transport is unknown
 		if logIt {
 			fields := logrus.Fields{"scope": scope, "ip": perIP, "legacy": limiter == s.legacy}
 			if scope == "global" {
