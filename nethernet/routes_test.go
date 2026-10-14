@@ -168,6 +168,8 @@ func TestRouteTableWarnsWhenAClaimGainsOrLosesASecondClaimant(t *testing.T) {
 	require.Len(t, got, 2, "the host and the legacy port each gained a second claimant")
 	for _, e := range got {
 		assert.Equal(t, []string{b1Older, b1Newer}, e.Data["claimants"])
+		assert.Equal(t, b1Newer, e.Data["service"], "names the Service that joined")
+		assert.Equal(t, b1Newer, e.Data["winner"], "names who serves the route now")
 	}
 
 	rt.Upsert(b1Older, []string{"shared.uniz.host"}, b1Backend(b1Older, 30001)) // a slice event
@@ -179,5 +181,7 @@ func TestRouteTableWarnsWhenAClaimGainsOrLosesASecondClaimant(t *testing.T) {
 	require.Len(t, got, 2, "the host and the legacy port each lost their second claimant")
 	for _, e := range got {
 		assert.Equal(t, []string{b1Older, b1Newer}, e.Data["claimants"])
+		assert.Equal(t, b1Newer, e.Data["service"], "names the Service that left")
+		assert.Equal(t, b1Older, e.Data["winner"], "names who serves the route now")
 	}
 }

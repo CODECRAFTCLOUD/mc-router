@@ -108,7 +108,7 @@ func addClaim[K comparable](m map[K][]string, kind string, k K, svcKey string) {
 	}
 	m[k] = slices.Insert(m[k], i, svcKey)
 	if len(m[k]) > 1 {
-		warnClaim(kind, k, m[k], "nethernet: Services claim the same route; the newest (highest name) wins")
+		warnClaim(kind, k, m[k], svcKey, m[k][len(m[k])-1], "nethernet: Services claim the same route; the newest (highest name) wins")
 	}
 }
 
@@ -118,7 +118,8 @@ func dropClaim[K comparable](m map[K][]string, kind string, k K, svcKey string) 
 		return
 	}
 	if len(m[k]) > 1 {
-		warnClaim(kind, k, m[k], "nethernet: a Service gave up a contested route; the highest remaining name wins")
+		rest := slices.Delete(slices.Clone(m[k]), i, i+1)
+		warnClaim(kind, k, m[k], svcKey, rest[len(rest)-1], "nethernet: a Service gave up a contested route; the highest remaining name wins")
 	}
 	if c := slices.Delete(m[k], i, i+1); len(c) > 0 {
 		m[k] = c
@@ -127,9 +128,13 @@ func dropClaim[K comparable](m map[K][]string, kind string, k K, svcKey string) 
 	}
 }
 
-// warnClaim makes a leaked Service visible: it names every claimant, sorted.
-func warnClaim[K comparable](kind string, k K, claimants []string, msg string) {
-	logrus.WithFields(logrus.Fields{"route": fmt.Sprintf("%s %v", kind, k), "claimants": slices.Clone(claimants)}).Warn(msg)
+// warnClaim makes a leaked Service visible: it names every claimant involved
+// (sorted), the Service that joined or left, and the one that serves now.
+func warnClaim[K comparable](kind string, k K, claimants []string, service, winner, msg string) {
+	logrus.WithFields(logrus.Fields{
+		"route": fmt.Sprintf("%s %v", kind, k), "claimants": slices.Clone(claimants),
+		"service": service, "winner": winner,
+	}).Warn(msg)
 }
 
 func (t *RouteTable) ByHost(host string) (Backend, bool) {
