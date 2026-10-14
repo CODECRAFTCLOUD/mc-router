@@ -36,6 +36,12 @@ const (
 // cache (a missing RBAC rule otherwise hangs startup silently).
 var syncWarnEvery = 30 * time.Second
 
+// syncWarnTicks is the warning clock; tests replace it to own the ticks.
+var syncWarnTicks = func() (<-chan time.Time, func()) {
+	t := time.NewTicker(syncWarnEvery)
+	return t.C, t.Stop
+}
+
 type serviceRoutes struct {
 	mu       sync.Mutex // one apply at a time, so the last apply reads the newest caches
 	table    *RouteTable
@@ -75,8 +81,8 @@ func WatchServices(ctx context.Context, client kubernetes.Interface, namespace s
 	// list has gone through apply (client-go shared_informer.go).
 	synced := make(chan bool, 1)
 	go func() { synced <- cache.WaitForCacheSync(ctx.Done(), svcReg.HasSynced, sliceReg.HasSynced) }()
-	tick := time.NewTicker(syncWarnEvery)
-	defer tick.Stop()
+	ticks, stopTicks := syncWarnTicks()
+	defer stopTicks()
 	for {
 		select {
 		case ok := <-synced:
@@ -84,7 +90,7 @@ func WatchServices(ctx context.Context, client kubernetes.Interface, namespace s
 				return errors.New("nethernet: service/endpointslice informers did not sync")
 			}
 			return nil
-		case <-tick.C:
+		case <-ticks:
 			for _, c := range []struct {
 				resource string
 				reg      cache.ResourceEventHandlerRegistration

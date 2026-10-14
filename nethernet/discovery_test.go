@@ -246,27 +246,45 @@ func TestDiscoveryRoutesAServiceBeforeItsSlicesExist(t *testing.T) {
 }
 
 // M-3: a missing RBAC rule must show in the logs, naming what is unsynced.
+// B-I M-2: the test owns the tick, and sends it only after the services
+// handler has applied its initial list, so the outcome never depends on timing.
 func TestDiscoveryWarnsWhileACacheStaysUnsynced(t *testing.T) {
 	hook := logrustest.NewGlobal()
 	t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{}) })
-	old := syncWarnEvery
-	syncWarnEvery = 20 * time.Millisecond
-	t.Cleanup(func() { syncWarnEvery = old })
+	ticks := make(chan time.Time)
+	old := syncWarnTicks
+	syncWarnTicks = func() (<-chan time.Time, func()) { return ticks, func() {} }
+	t.Cleanup(func() { syncWarnTicks = old })
 
 	client := fake.NewClientset()
+	_, err := client.CoreV1().Services(b1Namespace).Create(context.Background(),
+		b1Service("mc-a", b1Published(), b1NNPort()), metav1.CreateOptions{})
+	require.NoError(t, err)
 	client.PrependReactor("list", "endpointslices", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "discovery.k8s.io", Resource: "endpointslices"}, "", errors.New("no RBAC rule"))
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	assert.Error(t, WatchServices(ctx, client, b1Namespace, NewRouteTable()), "the wait still ends only with ctx")
+	rt := NewRouteTable()
+	done := make(chan error, 1)
+	go func() { done <- WatchServices(ctx, client, b1Namespace, rt) }()
 
-	var named []string
-	for _, e := range hook.AllEntries() {
-		if e.Level == logrus.WarnLevel {
-			named = append(named, fmt.Sprint(e.Data["resource"]))
+	b1Eventually(t, func() bool { _, ok := rt.ByHost("survival.uniz.host"); return ok },
+		"the services handler applied its initial list")
+	ticks <- time.Now()
+	warned := func() (named []string) {
+		for _, e := range hook.AllEntries() {
+			if e.Level == logrus.WarnLevel {
+				named = append(named, fmt.Sprint(e.Data["resource"]))
+			}
 		}
+		return named
 	}
-	assert.Contains(t, named, "endpointslices")
-	assert.NotContains(t, named, "services", "the synced resource is not named")
+	// The loop checks services before endpointslices, so a wrongly named
+	// services would be the first warning of the tick.
+	b1Eventually(t, func() bool { return len(warned()) > 0 }, "the tick warns")
+	assert.Equal(t, []string{"endpointslices"}, warned(), "only the unsynced resource is named")
+
+	cancel()
+	assert.Error(t, <-done, "the wait still ends only with ctx")
 }
