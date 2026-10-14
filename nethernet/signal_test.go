@@ -1233,3 +1233,33 @@ func TestSignalAndRelayCarryOneJoinEndToEnd(t *testing.T) {
 	send(t, c, relayAddr, dtlsData)
 	bds.expect(t, dtlsData)
 }
+
+// Gate 1 across the seam: the POST lands on replica A, the client's checks on
+// replica B, which adopts the session from the shared registry. B's first
+// forwarded check nominates its own address, signed with the answer's ice-pwd.
+func TestSignalAndAnAdoptingRelayNominateTheNewPath(t *testing.T) {
+	f := newSigFixture(t)
+	bds := startBDS(t)
+	_, shared := sharedRedis(t)
+	toBDS := func(r *Relay) {
+		r.dialUpstream = func(netip.AddrPort) (*net.UDPConn, error) {
+			return net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(bds.addr))
+		}
+	}
+	a, aAddr := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil), toBDS)
+	_, bAddr := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil), toBDS)
+	f.opts.Relay, f.opts.PublicAddr = a, aAddr
+
+	offer := f.validOffer(t)
+	resp, body := sigDo(t, f.serve(t, 19132), sigReq{body: offer})
+	require.NotNil(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	off, err := ParseSDP(offer)
+	require.NoError(t, err)
+	ans, err := ParseSDP(body)
+	require.NoError(t, err)
+
+	pair := ans.IceUfrag + ":" + off.IceUfrag
+	got := sendUntilBDS(t, newClient(t), bAddr, controllingBinding(pair, ans.IcePwd), bds)
+	assertNominates(t, got, ans.IcePwd)
+}
