@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -56,7 +57,7 @@ type SignalOptions struct {
 	// GetCertificate, when set, is used instead of TLSCert, so the binary can
 	// serve a renewed certificate without a restart (Ruling R29).
 	GetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
-	TLSDomains     []string // an SNI equal to or under one of these is served TLS
+	TLSDomains     []string // TLS is served for an SNI under one of these that the certificate covers
 	// SignalPort is the main listener's port. Only there is a PROXY v2 header
 	// read, and only from a TrustedProxies peer; every other port is a legacy
 	// listener, whose source is the relay (spec §6.1).
@@ -76,7 +77,7 @@ type SignalOptions struct {
 // join offer (POST), waking an asleep server for a verified player only.
 type SignalServer struct {
 	o       SignalOptions
-	tlsConf *tls.Config
+	getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error) // nil: TLS is never served
 	limiter *connRateLimiter
 	wakes   *wakeLimiter
 	hc      *http.Client
@@ -86,12 +87,9 @@ type SignalServer struct {
 func NewSignalServer(o SignalOptions) *SignalServer {
 	s := &SignalServer{o: o, limiter: newConnRateLimiter(o.GlobalRate, o.PerIPRate),
 		wakes: &wakeLimiter{byXUID: map[string][]time.Time{}}, now: time.Now}
-	getCert := o.GetCertificate
-	if getCert == nil && o.TLSCert != nil {
-		getCert = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return o.TLSCert, nil }
-	}
-	if getCert != nil {
-		s.tlsConf = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: getCert}
+	s.getCert = o.GetCertificate
+	if s.getCert == nil && o.TLSCert != nil {
+		s.getCert = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return o.TLSCert, nil }
 	}
 	s.hc = &http.Client{ // plain HTTP to the backend: never a PROXY header, never an env proxy
 		Transport:     &http.Transport{DisableKeepAlives: true, MaxResponseHeaderBytes: maxHeaderBytes},
@@ -192,13 +190,15 @@ func (s *SignalServer) terminateTLS(ctx context.Context, conn net.Conn, br *bufi
 		}
 		sni = clientHelloSNI(rec)
 	}
-	if s.tlsConf == nil || !s.ownsSNI(sni) {
+	cert := s.certFor(sni)
+	if cert == nil {
 		s.o.Metrics.tlsHandshake("refused_sni")
 		s.o.Metrics.signal("tls_refused")
 		_, _ = conn.Write(tlsHandshakeFailure)
 		return nil, false
 	}
-	tc := tls.Server(bufferedConn{Conn: conn, r: br}, s.tlsConf)
+	// The pair just checked is the pair served, even if the loader swaps it now.
+	tc := tls.Server(bufferedConn{Conn: conn, r: br}, &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{*cert}})
 	if err := tc.HandshakeContext(ctx); err != nil {
 		s.o.Metrics.tlsHandshake("failed")
 		logrus.WithError(err).Debug("nethernet: TLS handshake failed")
@@ -208,8 +208,32 @@ func (s *SignalServer) terminateTLS(ctx context.Context, conn net.Conn, br *bufi
 	return tc, true
 }
 
-func (s *SignalServer) ownsSNI(sni string) bool {
+// certFor returns the certificate to serve for sni, or nil when TLS must be
+// refused: the name must be under one of TLSDomains and covered by the leaf
+// the loader serves now (spec §6.3: never a certificate whose name does not
+// match), so the certificate stays the source of truth across renewals.
+func (s *SignalServer) certFor(sni string) *tls.Certificate {
 	sni = strings.TrimSuffix(strings.ToLower(sni), ".")
+	if s.getCert == nil || !s.ownsSNI(sni) {
+		return nil
+	}
+	cert, err := s.getCert(&tls.ClientHelloInfo{ServerName: sni})
+	if err != nil || cert == nil || len(cert.Certificate) == 0 {
+		return nil
+	}
+	leaf := cert.Leaf
+	if leaf == nil {
+		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+			return nil
+		}
+	}
+	if leaf.VerifyHostname(sni) != nil {
+		return nil
+	}
+	return cert
+}
+
+func (s *SignalServer) ownsSNI(sni string) bool {
 	if sni == "" {
 		return false
 	}

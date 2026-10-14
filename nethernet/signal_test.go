@@ -366,6 +366,33 @@ func TestSignalTerminatesTLSForOurDomain(t *testing.T) {
 	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.TLSHandshakes.WithLabelValues("ok")))
 }
 
+// Spec §6.3: never present a certificate whose name does not match. A name
+// under a TLS domain that the served certificate does not cover gets BDS's
+// alert, so the client falls back to plain HTTP.
+func TestSignalServesTLSOnlyForNamesTheCertificateCovers(t *testing.T) {
+	f := newSigFixture(t)
+	f.opts.TLSCert = sigCert(t) // *.uniz.host and *.mc.uniz.host
+	addr := f.serve(t, 19132)
+	for sni, served := range map[string]bool{
+		"a.uniz.host": true, "a.mc.uniz.host": true, "x.y.uniz.host": false, "uniz.host": false,
+	} {
+		raw, err := net.Dial("tcp4", addr)
+		require.NoError(t, err)
+		rec := &recordingConn{Conn: raw}
+		err = tls.Client(rec, &tls.Config{ServerName: sni, InsecureSkipVerify: true}).Handshake() // the test judges the name itself
+		if served {
+			assert.NoError(t, err, sni)
+		} else {
+			assert.Error(t, err, sni)
+			rec.mu.Lock()
+			assert.Equal(t, tlsHandshakeFailure, rec.got, "%s gets BDS's handshake_failure alert", sni)
+			rec.mu.Unlock()
+		}
+		_ = raw.Close()
+	}
+	assert.Equal(t, 2.0, testutil.ToFloat64(f.metrics.TLSHandshakes.WithLabelValues("refused_sni")))
+}
+
 func TestSignalSynthesizesTheAsleepCard(t *testing.T) {
 	f := newSigFixture(t)
 	f.asleep()

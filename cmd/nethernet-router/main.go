@@ -51,7 +51,7 @@ type Config struct {
 	PublicIp                  string        `usage:"Required. The IP literal every SDP answer advertises (a hostname makes the client fail with Door)"`
 	TlsCert                   string        `usage:"Path to the TLS certificate (PEM); re-read when the file changes"`
 	TlsKey                    string        `usage:"Path to the TLS private key (PEM)"`
-	TlsDomains                []string      `default:"uniz.host,mc.uniz.host" usage:"TLS is served for an SNI equal to or under one of these; any other SNI gets a handshake_failure alert"`
+	TlsDomains                []string      `default:"uniz.host,mc.uniz.host" usage:"TLS is served for an SNI under one of these that the certificate covers; any other SNI gets a handshake_failure alert"`
 	TrustedProxies            []string      `usage:"CIDRs whose PROXY v2 header is read on the signal port"`
 	RedisAddr                 string        `usage:"host:port of the shared session registry; empty keeps sessions in this replica only"`
 	RedisPassword             string        `usage:"Password for the shared session registry"`
