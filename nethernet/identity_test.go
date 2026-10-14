@@ -503,3 +503,61 @@ func TestIdentityRefreshPicksUpARotatedKey(t *testing.T) {
 	_, err = f.v.Verify(context.Background(), f.offer(t, nil))
 	assert.Error(t, err, "a key Microsoft removed is no longer trusted")
 }
+
+// N-1: the empty-cache floor is measured from the end of a fetch, so callers
+// queued behind a slow failed fetch do not each repeat it.
+func TestIdentityQueuedCallersDoNotRepeatASlowFailedFetch(t *testing.T) {
+	f := identSetup(t)
+	var fetches atomic.Int32
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		f.clock.add(6 * time.Second) // the fetch outlasts the 5 s floor
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(slow.Close)
+	v := NewIdentityVerifier(slow.URL, slow.Client(), f.clock.now)
+
+	_, err := v.Verify(context.Background(), f.offer(t, nil))
+	assert.Error(t, err)
+	_, err = v.Verify(context.Background(), f.offer(t, nil)) // the caller that queued behind it
+	assert.Error(t, err)
+	assert.EqualValues(t, 1, fetches.Load(), "the second caller sees a fresh fetch and does not repeat it")
+}
+
+// N-1, the re-review's P2 shape on the real clock: three callers against a JWKS
+// that never answers all return when the one 10 s fetch times out.
+func TestIdentityConcurrentCallersShareOneHangingFetch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for the 10 s fetch timeout")
+	}
+	f := identSetup(t)
+	var fetches atomic.Int32
+	release := make(chan struct{})
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		<-release
+	}))
+	t.Cleanup(hang.Close)
+	t.Cleanup(func() { close(release) }) // runs first, so Close does not wait on the handler
+	v := NewIdentityVerifier(hang.URL, hang.Client(), time.Now)
+
+	offer := f.offer(t, nil)
+	start := time.Now()
+	var wg sync.WaitGroup
+	took := make([]time.Duration, 3)
+	for i := range took {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second) // B3's hold
+			defer cancel()
+			_, _ = v.Verify(ctx, offer)
+			took[i] = time.Since(start)
+		}()
+	}
+	wg.Wait()
+	for i, d := range took {
+		assert.Less(t, d, 13*time.Second, "caller %d", i)
+	}
+	assert.EqualValues(t, 1, fetches.Load())
+}

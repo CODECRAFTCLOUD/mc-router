@@ -288,6 +288,7 @@ func (v *IdentityVerifier) key(ctx context.Context, kid string) (*rsa.PublicKey,
 // the cached keys and returns the error. The router calls it once at start
 // (non-fatal: Verify still fetches lazily) and every 6 h after that, so a key
 // Microsoft removes stops being trusted without waiting for an unknown kid.
+// Like every fetch it ignores ctx's cancellation and is bounded by 10 s only.
 func (v *IdentityVerifier) Refresh(ctx context.Context) error {
 	v.fetchMu.Lock()
 	defer v.fetchMu.Unlock()
@@ -301,11 +302,10 @@ func (v *IdentityVerifier) Refresh(ctx context.Context) error {
 func (v *IdentityVerifier) fetchLocked(ctx context.Context) error {
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jwksFetchTimeout)
 	defer cancel()
-	now := v.now()
 	keys, err := v.fetchJWKS(fctx)
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.lastFetch = now
+	v.lastFetch = v.now() // stamped at the end: callers queued behind a slow fetch do not repeat it (N-1)
 	if err == nil {
 		v.keys = keys
 	}
