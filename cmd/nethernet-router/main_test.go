@@ -78,10 +78,38 @@ func TestConfigSignalingLimitsReachSignalOptions(t *testing.T) {
 	assert.Equal(t, 3*time.Second, o.RequestTimeout)
 }
 
+func TestConfigWakeLimitsReachSignalOptions(t *testing.T) {
+	base := []string{"--public-ip", "82.26.104.95", "--api-url", "http://api", "--api-token", "t"}
+	c, err := parseConfig(base)
+	require.NoError(t, err)
+	o := c.signalOptions()
+	assert.Equal(t, 5, o.WakesPerPlayer)
+	assert.Equal(t, time.Hour, o.WakeWindow)
+	assert.Equal(t, 5*time.Second, o.WakeBackoff)
+
+	c, err = parseConfig(append(base, "--wake-limit-per-player", "3", "--wake-limit-window", "30m", "--wake-backoff", "10s"))
+	require.NoError(t, err)
+	o = c.signalOptions()
+	assert.Equal(t, 3, o.WakesPerPlayer)
+	assert.Equal(t, 30*time.Minute, o.WakeWindow)
+	assert.Equal(t, 10*time.Second, o.WakeBackoff)
+
+	t.Setenv("NETHERNET_WAKE_LIMIT_PER_PLAYER", "7")
+	t.Setenv("NETHERNET_WAKE_LIMIT_WINDOW", "2h")
+	t.Setenv("NETHERNET_WAKE_BACKOFF", "3s")
+	c, err = parseConfig(base)
+	require.NoError(t, err)
+	o = c.signalOptions()
+	assert.Equal(t, 7, o.WakesPerPlayer)
+	assert.Equal(t, 2*time.Hour, o.WakeWindow)
+	assert.Equal(t, 3*time.Second, o.WakeBackoff)
+}
+
 func TestConfigRejectsUnusableSignalingLimits(t *testing.T) {
 	base := []string{"--public-ip", "82.26.104.95", "--api-url", "http://api", "--api-token", "t"}
 	for _, bad := range [][]string{
 		{"--max-body", "0"}, {"--request-timeout", "0s"}, {"--signal-rate-per-ip", "-1"}, {"--signal-rate-global", "-1"},
+		{"--wake-limit-per-player", "0"}, {"--wake-limit-window", "0s"}, {"--wake-backoff", "0s"},
 	} {
 		_, err := parseConfig(append(slices.Clone(base), bad...))
 		assert.ErrorContains(t, err, strings.TrimPrefix(bad[0], "--"), bad)

@@ -152,6 +152,7 @@ func newSigFixture(t *testing.T) *sigFixture {
 		Routes: f.routes, Relay: f.relay, Waker: f.waker, PublicAddr: netip.MustParseAddrPort(sigPublic),
 		TLSDomains: []string{"uniz.host", "mc.uniz.host"}, SignalPort: 19132,
 		WakeHold: 2 * time.Second, ProbeTimeout: 300 * time.Millisecond, MaxBody: 1 << 20, RequestTimeout: 5 * time.Second,
+		WakesPerPlayer: 5, WakeWindow: time.Hour, WakeBackoff: 5 * time.Second,
 		PerIPRate: 5, GlobalRate: 200, Identity: f.ident.v, Metrics: f.metrics,
 	}
 	f.awake()
@@ -566,7 +567,7 @@ func TestSignalLimitsWakesPerPlayer(t *testing.T) {
 		resp, _ := sigDo(t, addr, sigReq{body: offer})
 		require.NotNil(t, resp, i)
 		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, i)
-		clk.add(wakeBackoff) // past the port's wake back-off (M-5), well inside the hour
+		clk.add(f.opts.WakeBackoff) // past the port's wake back-off (M-5), well inside the hour
 	}
 	assert.Equal(t, 7, f.waker.count(), "2 non-wakes + 5 actual wakes reach the API")
 	resp, _ := sigDo(t, addr, sigReq{body: offer})
@@ -650,11 +651,34 @@ func TestSignalBacksOffTheWakeAPIPerPort(t *testing.T) {
 	})
 }
 
+// The per-player wake limit, its window and the port back-off are options
+// (spec §6.8), and the server uses the values it is given.
+func TestSignalUsesTheConfiguredWakeLimits(t *testing.T) {
+	f := newSigFixture(t)
+	f.opts.WakesPerPlayer, f.opts.WakeWindow, f.opts.WakeBackoff = 2, 10*time.Minute, 2*time.Second
+	s := NewSignalServer(f.opts)
+	t0 := time.Now()
+	for i := range 2 {
+		_, ok := s.wakes.reserve("x", t0)
+		require.True(t, ok, i)
+	}
+	_, ok := s.wakes.reserve("x", t0)
+	assert.False(t, ok, "the 3rd wake is over a limit of 2")
+	_, ok = s.wakes.reserve("x", t0.Add(10*time.Minute))
+	assert.True(t, ok, "a 10-minute window has passed")
+
+	s.backoff.put(sigLegacy, cachedWake{at: t0, res: WakeResult{Booting: true}})
+	_, cached := s.backoff.get(sigLegacy, t0.Add(time.Second))
+	assert.True(t, cached, "inside a 2 s back-off")
+	_, cached = s.backoff.get(sigLegacy, t0.Add(2*time.Second))
+	assert.False(t, cached, "a 2 s back-off is over")
+}
+
 // R34 is a rolling hour: a wake stops counting an hour after it.
 func TestWakeLimiterForgetsAWakeAfterAnHour(t *testing.T) {
-	l := &wakeLimiter{byXUID: map[string][]time.Time{}}
+	l := newWakeLimiter(5, time.Hour)
 	t0 := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
-	for i := range wakesPerPlayer {
+	for i := range 5 {
 		_, ok := l.reserve("x", t0.Add(time.Duration(i)*time.Minute))
 		require.True(t, ok, i)
 	}
@@ -669,7 +693,7 @@ func TestWakeLimiterForgetsAWakeAfterAnHour(t *testing.T) {
 // The minute sweep drops players with no wake in the last hour, so the map
 // holds only players seen this hour.
 func TestWakeLimiterSweepsPlayersWithNoWakeThisHour(t *testing.T) {
-	l := &wakeLimiter{byXUID: map[string][]time.Time{}}
+	l := newWakeLimiter(5, time.Hour)
 	t0 := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
 	l.reserve("old", t0)
 	l.reserve("recent", t0.Add(30*time.Minute))

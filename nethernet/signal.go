@@ -32,14 +32,6 @@ const (
 	pollEvery      = 500 * time.Millisecond
 	maxHeaderBytes = 64 << 10
 	maxTLSRecord   = 16 << 10 // a ClientHello is read as one TLS record
-	// Ruling R34: one verified player causes at most 5 actual wakes per rolling
-	// hour on this replica; a lifted identity assertion can wake, never join.
-	wakesPerPlayer = 5
-	wakeWindow     = time.Hour
-	// Ruling M-5: after the API answers booting or refuses a legacy port's
-	// wake, that answer is reused for this long instead of calling the API
-	// again, which bounds the calls one lifted assertion can cause.
-	wakeBackoff = 5 * time.Second
 )
 
 // tlsHandshakeFailure is the fatal handshake_failure alert BDS sends to a TLS
@@ -71,8 +63,17 @@ type SignalOptions struct {
 	// PerIPRate (bursts to 4x) applies to a player's own address only; GlobalRate
 	// (bursts to 2x) to every connection. Per second; 0 disables a tier.
 	PerIPRate, GlobalRate int
-	Identity              *IdentityVerifier
-	Metrics               *Metrics
+	// Ruling R34: one verified player causes at most WakesPerPlayer actual
+	// wakes per rolling WakeWindow on this replica; a lifted identity
+	// assertion can wake, never join.
+	WakesPerPlayer int
+	WakeWindow     time.Duration
+	// Ruling M-5: how long the API's booting or refused answer for a legacy
+	// port is reused instead of calling the API again, which bounds the calls
+	// one lifted assertion can cause.
+	WakeBackoff time.Duration
+	Identity    *IdentityVerifier
+	Metrics     *Metrics
 }
 
 // SignalServer answers NetherNet signaling: the server-list card (GET) and the
@@ -89,7 +90,7 @@ type SignalServer struct {
 
 func NewSignalServer(o SignalOptions) *SignalServer {
 	s := &SignalServer{o: o, limiter: newConnRateLimiter(o.GlobalRate, o.PerIPRate),
-		wakes: &wakeLimiter{byXUID: map[string][]time.Time{}}, backoff: wakeBackoffCache{byPort: map[int]cachedWake{}}, now: time.Now}
+		wakes: newWakeLimiter(o.WakesPerPlayer, o.WakeWindow), backoff: wakeBackoffCache{ttl: o.WakeBackoff, byPort: map[int]cachedWake{}}, now: time.Now}
 	s.getCert = o.GetCertificate
 	if s.getCert == nil && o.TLSCert != nil {
 		s.getCert = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return o.TLSCert, nil }
@@ -565,8 +566,14 @@ func (j *join) reply(status int, h http.Header, body []byte, result string) {
 	_ = resp.Write(j.rw)
 }
 
-// wakeLimiter counts each player's actual wakes over the last wakeWindow.
+func newWakeLimiter(limit int, window time.Duration) *wakeLimiter {
+	return &wakeLimiter{limit: limit, window: window, byXUID: map[string][]time.Time{}}
+}
+
+// wakeLimiter counts each player's actual wakes over the last window.
 type wakeLimiter struct {
+	limit     int
+	window    time.Duration
 	mu        sync.Mutex
 	byXUID    map[string][]time.Time
 	lastSweep time.Time
@@ -578,9 +585,9 @@ func (l *wakeLimiter) reserve(xuid string, now time.Time) (time.Time, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	fresh := func(ts []time.Time) []time.Time {
-		return slices.DeleteFunc(ts, func(t time.Time) bool { return now.Sub(t) >= wakeWindow })
+		return slices.DeleteFunc(ts, func(t time.Time) bool { return now.Sub(t) >= l.window })
 	}
-	if now.Sub(l.lastSweep) >= ipSweepEvery { // bounds the map to players seen this hour
+	if now.Sub(l.lastSweep) >= ipSweepEvery { // bounds the map to players seen this window
 		l.lastSweep = now
 		for x, ts := range l.byXUID {
 			if ts = fresh(ts); len(ts) == 0 {
@@ -591,7 +598,7 @@ func (l *wakeLimiter) reserve(xuid string, now time.Time) (time.Time, bool) {
 		}
 	}
 	ts := fresh(l.byXUID[xuid])
-	if len(ts) >= wakesPerPlayer {
+	if len(ts) >= l.limit {
 		l.byXUID[xuid] = ts
 		return time.Time{}, false
 	}
@@ -609,11 +616,12 @@ func (l *wakeLimiter) release(xuid string, at time.Time) {
 }
 
 // wakeBackoffCache holds each legacy port's last booting or refused wake
-// answer from the API for wakeBackoff (Ruling M-5); a failed call is never
+// answer from the API for ttl (Ruling M-5); a failed call is never
 // held. Joins that miss together, before the first call returns, each call
 // the API: that burst is bounded by the signaling rate limits. It holds at
 // most one entry per published legacy port.
 type wakeBackoffCache struct {
+	ttl    time.Duration
 	mu     sync.Mutex
 	byPort map[int]cachedWake
 }
@@ -627,7 +635,7 @@ func (c *wakeBackoffCache) get(port int, now time.Time) (WakeResult, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	w, ok := c.byPort[port]
-	if ok && now.Sub(w.at) >= wakeBackoff {
+	if ok && now.Sub(w.at) >= c.ttl {
 		delete(c.byPort, port)
 		return WakeResult{}, false
 	}

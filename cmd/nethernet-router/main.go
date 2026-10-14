@@ -68,6 +68,9 @@ type Config struct {
 	SignalRateGlobal          int           `default:"200" usage:"Signaling connections per second in all, bursting to 2x; 0 disables"`
 	MaxBody                   int64         `default:"1048576" usage:"Largest signaling request or backend answer body, in bytes"`
 	RequestTimeout            time.Duration `default:"5s" usage:"Time from accept to a fully read signaling request: PROXY header, TLS handshake, headers and body"`
+	WakeLimitPerPlayer        int           `default:"5" usage:"Actual wakes one verified player may cause per --wake-limit-window on this replica"`
+	WakeLimitWindow           time.Duration `default:"1h" usage:"Rolling window of --wake-limit-per-player"`
+	WakeBackoff               time.Duration `default:"5s" usage:"After the API answers booting or refuses a port's wake, reuse that answer this long instead of calling it again"`
 	MetricsBinding            string        `default:":8080" usage:"host:port serving /metrics and /healthz only"`
 	Debug                     bool          `usage:"Enable debug logs"`
 }
@@ -117,6 +120,9 @@ func (c *Config) validate() error {
 	}
 	if c.MaxBody <= 0 || c.RequestTimeout <= 0 {
 		return errors.New("--max-body and --request-timeout must be > 0")
+	}
+	if c.WakeLimitPerPlayer <= 0 || c.WakeLimitWindow <= 0 || c.WakeBackoff <= 0 {
+		return errors.New("--wake-limit-per-player, --wake-limit-window and --wake-backoff must be > 0")
 	}
 	if c.SignalRatePerIp < 0 || c.SignalRateGlobal < 0 {
 		return errors.New("--signal-rate-per-ip and --signal-rate-global must be >= 0 (0 disables)")
@@ -309,6 +315,7 @@ func (c *Config) signalOptions() nethernet.SignalOptions {
 		TLSDomains: c.TlsDomains, SignalPort: c.SignalPort, TrustedProxies: trusted,
 		WakeHold: c.WakeHold, ProbeTimeout: c.ProbeTimeout, MaxBody: c.MaxBody, RequestTimeout: c.RequestTimeout,
 		PerIPRate: c.SignalRatePerIp, GlobalRate: c.SignalRateGlobal,
+		WakesPerPlayer: c.WakeLimitPerPlayer, WakeWindow: c.WakeLimitWindow, WakeBackoff: c.WakeBackoff,
 	}
 }
 
