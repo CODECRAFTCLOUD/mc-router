@@ -434,6 +434,9 @@ func (j *join) wake(ctx context.Context, req *http.Request, offer []byte, b Back
 		}
 		select {
 		case <-hold.Done():
+			if ctx.Err() != nil { // the player hung up, not a slow boot
+				return refuse(http.StatusServiceUnavailable, "cancelled")
+			}
 			return refuse(http.StatusServiceUnavailable, "timeout")
 		case <-tick.C:
 		}

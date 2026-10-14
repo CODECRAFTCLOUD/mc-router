@@ -457,6 +457,20 @@ func TestSignalAnswers503AfterTheHold(t *testing.T) {
 	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")))
 }
 
+// Gate 1 tells a player who hung up during the hold from a slow boot.
+func TestSignalCountsAHangUpDuringTheHoldAsCancelled(t *testing.T) {
+	f := newSigFixture(t)
+	f.opts.WakeHold = 5 * time.Second // never ready
+	f.asleep()
+	addr := f.serve(t, 19132)
+	sigDo(t, addr, sigReq{body: f.validOffer(t), closeAfter: 300 * time.Millisecond})
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("cancelled")) == 1
+	}, 3*time.Second, 20*time.Millisecond, "the hang-up ends the hold as cancelled")
+	assert.Equal(t, 1, f.waker.count(), "the wake was called before the hang-up")
+	assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")))
+}
+
 func TestSignalHoldsWhenAlreadyBooting(t *testing.T) {
 	f := newSigFixture(t)
 	f.asleep()
