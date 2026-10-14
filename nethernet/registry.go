@@ -13,15 +13,19 @@ import (
 
 // Session is what the relay needs to forward one join: where BDS listens and
 // the ICE password that signs the client's connectivity checks. Stored as the
-// spec 6.5 JSON {serverId, target, icePwd}, plus signalIp.
+// spec 6.5 JSON {serverId, target, icePwd}, plus signalIp, signalIpTrusted and
+// createdAt.
 type Session struct {
 	ServerID string         `json:"serverId"`
 	Target   netip.AddrPort `json:"target"`
 	IcePwd   string         `json:"icePwd"`
 	SignalIP netip.Addr     `json:"signalIp"` // the player IP that POSTed the offer
-	// SignalIPTrusted is true when SignalIP is the player's own address (PROXY v2
-	// on the main listener). On the legacy listener every player arrives from the
-	// relay's address, so it is false there and no per-IP cap applies.
+	// SignalIPTrusted (Ruling R36) is true when SignalIP is the player's own
+	// address: the PROXY v2 source when the header came from a trusted proxy, or
+	// the TCP peer when that peer is not a trusted proxy (a direct client). It is
+	// false on the legacy listeners, where every player arrives from the relay's
+	// address, and when a trusted proxy connects without a PROXY header. Only
+	// trusted sessions count against the per-IP cap.
 	SignalIPTrusted bool `json:"signalIpTrusted"`
 	// CreatedAt is set by Relay.Register (UTC) and travels with the session, so
 	// HardReap measures from the first signal on every replica that adopts it.
