@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	core "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -148,4 +149,90 @@ func TestDiscoveryOnlyWatchesItsNamespace(t *testing.T) {
 	require.NoError(t, WatchServices(ctx, client, b1Namespace, rt))
 	_, ok := rt.ByHost("survival.uniz.host")
 	assert.False(t, ok)
+}
+
+func b1Slice(name, svc string, eps ...discoveryv1.Endpoint) *discoveryv1.EndpointSlice {
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: b1Namespace,
+			Labels: map[string]string{discoveryv1.LabelServiceName: svc},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints:   eps,
+	}
+}
+
+func b1Endpoint(ip string, ready *bool) discoveryv1.Endpoint {
+	return discoveryv1.Endpoint{Addresses: []string{ip}, Conditions: discoveryv1.EndpointConditions{Ready: ready}}
+}
+
+func b1PodIPs(rt *RouteTable) []netip.Addr {
+	b, _ := rt.ByHost("survival.uniz.host")
+	return b.PodIPs
+}
+
+func b1CreateSlice(t *testing.T, client *fake.Clientset, s *discoveryv1.EndpointSlice) {
+	t.Helper()
+	_, err := client.DiscoveryV1().EndpointSlices(b1Namespace).Create(context.Background(), s, metav1.CreateOptions{})
+	require.NoError(t, err)
+}
+
+func TestDiscoveryFillsPodIPsFromReadyEndpoints(t *testing.T) {
+	client, rt := b1Watch(t, b1Service("mc-a", b1Published(), b1NNPort()))
+	yes := true
+	b1CreateSlice(t, client, b1Slice("mc-a-1", "mc-a", b1Endpoint("10.244.3.17", &yes), b1Endpoint("10.244.3.18", nil)))
+	b1CreateSlice(t, client, b1Slice("other-1", "mc-other", b1Endpoint("10.244.9.9", &yes)))
+
+	want := []netip.Addr{netip.MustParseAddr("10.244.3.17"), netip.MustParseAddr("10.244.3.18")}
+	b1Eventually(t, func() bool { return assert.ObjectsAreEqual(want, b1PodIPs(rt)) }, "ready (and nil-ready) endpoints fill PodIPs")
+	b, _ := rt.ByHost("survival.uniz.host")
+	assert.Equal(t, netip.MustParseAddrPort("10.96.1.7:19132"), b.Addr, "Addr stays the ClusterIP")
+}
+
+func TestDiscoveryDropsNotReadyEndpoints(t *testing.T) {
+	no, yes := false, true
+	client := fake.NewClientset()
+	_, err := client.CoreV1().Services(b1Namespace).Create(context.Background(), b1Service("mc-a", b1Published(), b1NNPort()), metav1.CreateOptions{})
+	require.NoError(t, err)
+	b1CreateSlice(t, client, b1Slice("mc-a-1", "mc-a", b1Endpoint("10.244.3.17", &no), b1Endpoint("10.244.3.19", &yes)))
+	v6 := b1Slice("mc-a-2", "mc-a", b1Endpoint("fd00::17", &yes))
+	v6.AddressType = discoveryv1.AddressTypeIPv6
+	b1CreateSlice(t, client, v6)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := NewRouteTable()
+	require.NoError(t, WatchServices(ctx, client, b1Namespace, rt))
+	b1Eventually(t, func() bool {
+		return assert.ObjectsAreEqual([]netip.Addr{netip.MustParseAddr("10.244.3.19")}, b1PodIPs(rt))
+	}, "only the ready IPv4 endpoint counts")
+}
+
+func TestDiscoveryUpdatesPodIPsWhenTheSliceChanges(t *testing.T) {
+	client, rt := b1Watch(t, b1Service("mc-a", b1Published(), b1NNPort()))
+	yes, no := true, false
+	b1CreateSlice(t, client, b1Slice("mc-a-1", "mc-a", b1Endpoint("10.244.3.17", &yes)))
+	b1Eventually(t, func() bool { return len(b1PodIPs(rt)) == 1 }, "first pod IP")
+
+	_, err := client.DiscoveryV1().EndpointSlices(b1Namespace).Update(context.Background(),
+		b1Slice("mc-a-1", "mc-a", b1Endpoint("10.244.5.2", &yes)), metav1.UpdateOptions{})
+	require.NoError(t, err)
+	b1Eventually(t, func() bool {
+		return assert.ObjectsAreEqual([]netip.Addr{netip.MustParseAddr("10.244.5.2")}, b1PodIPs(rt))
+	}, "a rescheduled pod's new IP replaces the old one")
+
+	_, err = client.DiscoveryV1().EndpointSlices(b1Namespace).Update(context.Background(),
+		b1Slice("mc-a-1", "mc-a", b1Endpoint("10.244.5.2", &no)), metav1.UpdateOptions{})
+	require.NoError(t, err)
+	b1Eventually(t, func() bool { _, ok := rt.ByHost("survival.uniz.host"); return ok && len(b1PodIPs(rt)) == 0 }, "not ready empties PodIPs, the route stays")
+
+	require.NoError(t, client.DiscoveryV1().EndpointSlices(b1Namespace).Delete(context.Background(), "mc-a-1", metav1.DeleteOptions{}))
+	b1Eventually(t, func() bool { _, ok := rt.ByHost("survival.uniz.host"); return ok && len(b1PodIPs(rt)) == 0 }, "deleted slice")
+}
+
+func TestDiscoveryRoutesAServiceBeforeItsSlicesExist(t *testing.T) {
+	_, rt := b1Watch(t, b1Service("mc-a", b1Published(), b1NNPort()))
+	b, ok := rt.ByHost("survival.uniz.host")
+	require.True(t, ok, "an asleep server still routes so a join can wake it")
+	assert.Empty(t, b.PodIPs)
 }

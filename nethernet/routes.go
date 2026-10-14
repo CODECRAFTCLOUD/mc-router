@@ -8,11 +8,14 @@ import (
 )
 
 // Backend is one published Bedrock-side server: where its NetherNet signaling
-// port is (the mc-<id> Service's ClusterIP and `nethernet` port) and what the
-// router needs to wake it.
+// port is (the mc-<id> Service's ClusterIP and `nethernet` port), the IPv4
+// addresses of its ready pods (the only valid relay targets; empty while it is
+// asleep or not ready) and what the router needs to wake it. PodIPs is shared
+// and read-only: discovery replaces it, never mutates it.
 type Backend struct {
 	ServerID   string
 	Addr       netip.AddrPort
+	PodIPs     []netip.Addr
 	LegacyPort int
 	AsleepMOTD string
 }
