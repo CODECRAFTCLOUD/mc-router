@@ -2,6 +2,7 @@ package nethernet
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -31,6 +32,9 @@ const (
 	// A STUN USERNAME of maxUsername bytes or more is dropped: RFC 5389 section
 	// 15.3 allows fewer than 513 bytes.
 	maxUsername = 513
+	// The last renominateTxns rewritten checks of a session are remembered; a
+	// success for an older one (5 s consent interval) is long overdue.
+	renominateTxns = 8
 )
 
 // ErrSessionCap is Register's answer when the replica or the server holds its
@@ -71,6 +75,13 @@ type relaySession struct {
 	client      netip.AddrPort // guarded by Relay.mu
 	lastSeen    atomic.Int64   // Relay.since() of the last client datagram
 	lastShared  atomic.Int64   // Relay.since() of the last shared-registry refresh; 0 = never
+
+	// renominate is set on a session this replica adopted: the server's ICE
+	// agent knows another source address for it, so the client's checks are
+	// forwarded with USE-CANDIDATE until the server answers one (Relay.forward).
+	renominate  atomic.Bool
+	renominated [renominateTxns][12]byte // transaction ids rewritten; guarded by Relay.mu
+	renomNext   int                      // next slot of renominated; guarded by Relay.mu
 
 	publishing, republish bool           // guarded by Relay.mu
 	published             netip.AddrPort // the address in nn:client; owned by the one publish in flight
@@ -399,6 +410,9 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 		return nil, "dial_failed"
 	}
 	rs.upstream = up
+	// Adopted: the server knows this session from another replica's address.
+	// Signaled here, or rebound above: the server's view is this socket already.
+	rs.renominate.Store(adopted)
 	rs.lastSeen.Store(r.since())
 	rs.client = client
 	r.byClient[client] = rs
@@ -489,6 +503,18 @@ func (r *Relay) forward(rs *relaySession, pkt []byte) {
 	if last := rs.lastShared.Load(); last == 0 || now-last >= int64(r.opt.IdleTimeout/2) {
 		r.queuePublish(rs)
 	}
+	if rs.renominate.Load() {
+		// RFC 8445 regular nomination: a check with USE-CANDIDATE makes the
+		// server's ICE agent select this replica's address (gate 1, DEVIATIONS #411).
+		if out, ok := addUseCandidate(pkt, rs.s.IcePwd); ok {
+			r.mu.Lock() // recorded before the write: the success may beat the unlock otherwise
+			rs.renominated[rs.renomNext] = [12]byte(out[8:stunHeaderLen])
+			rs.renomNext = (rs.renomNext + 1) % renominateTxns
+			r.mu.Unlock()
+			pkt = out
+			r.opt.Metrics.renomination("sent")
+		}
+	}
 	if _, err := rs.upstream.Write(pkt); err != nil {
 		logrus.WithError(err).Debug("nethernet relay: upstream write failed")
 	}
@@ -505,11 +531,32 @@ func (r *Relay) pipeUpstream(rs *relaySession) {
 			}
 			continue
 		}
+		if rs.renominate.Load() {
+			r.confirmRenomination(rs, buf[:n])
+		}
 		r.mu.Lock()
 		client := rs.client
 		r.mu.Unlock()
 		if _, err := r.conn.WriteToUDPAddrPort(buf[:n], client); err != nil {
 			logrus.WithError(err).Debug("nethernet relay: client write failed")
+		}
+	}
+}
+
+// confirmRenomination ends rs's re-nomination when pkt is the server's Binding
+// Success Response to a check this replica rewrote. pipeUpstream only.
+func (r *Relay) confirmRenomination(rs *relaySession, pkt []byte) {
+	if !IsSTUN(pkt) || binary.BigEndian.Uint16(pkt[0:2]) != stunBindingSuccess {
+		return
+	}
+	tx := [12]byte(pkt[8:stunHeaderLen])
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, sent := range rs.renominated {
+		if sent == tx && sent != [12]byte{} && rs.renominate.CompareAndSwap(true, false) {
+			rs.renominated = [renominateTxns][12]byte{}
+			r.opt.Metrics.renomination("confirmed")
+			return
 		}
 	}
 }
