@@ -32,9 +32,6 @@ import (
 )
 
 const (
-	maxBody          = 1 << 20 // signaling POST body cap
-	perIPRate        = 5       // signaling connections per second per player IP, bursts to 20
-	globalRate       = 200     // signaling connections per second in all, bursts to 400
 	certCheckEvery   = 30 * time.Second
 	identityRefresh  = 6 * time.Hour // R35: a key Microsoft removes stops being trusted
 	shutdownGrace    = 5 * time.Second
@@ -67,6 +64,10 @@ type Config struct {
 	UnboundTtl                time.Duration `default:"60s" usage:"How long a signaled session waits for its first verified STUN check"`
 	IdleTimeout               time.Duration `default:"30s" usage:"A bound session with no client datagram for this long is dropped"`
 	HardReap                  time.Duration `default:"0s" usage:"Drop any session this old; 0 disables"`
+	SignalRatePerIp           int           `default:"5" usage:"Signaling connections per second per player IP (IPv6 /64), bursting to 4x; the player's own address only, never a relay's; 0 disables"`
+	SignalRateGlobal          int           `default:"200" usage:"Signaling connections per second in all, bursting to 2x; 0 disables"`
+	MaxBody                   int64         `default:"1048576" usage:"Largest signaling request or backend answer body, in bytes"`
+	RequestTimeout            time.Duration `default:"5s" usage:"Time from accept to a fully read signaling request: PROXY header, TLS handshake, headers and body"`
 	MetricsBinding            string        `default:":8080" usage:"host:port serving /metrics and /healthz only"`
 	Debug                     bool          `usage:"Enable debug logs"`
 }
@@ -113,6 +114,12 @@ func (c *Config) validate() error {
 	}
 	if c.WakeHold <= 0 || c.ProbeTimeout <= 0 {
 		return errors.New("--wake-hold and --probe-timeout must be > 0")
+	}
+	if c.MaxBody <= 0 || c.RequestTimeout <= 0 {
+		return errors.New("--max-body and --request-timeout must be > 0")
+	}
+	if c.SignalRatePerIp < 0 || c.SignalRateGlobal < 0 {
+		return errors.New("--signal-rate-per-ip and --signal-rate-global must be >= 0 (0 disables)")
 	}
 	return nil
 }
@@ -257,14 +264,10 @@ func run(cfg *Config) error {
 		return err
 	}
 
-	trusted, _ := cfg.trustedProxies()
-	server := nethernet.NewSignalServer(nethernet.SignalOptions{
-		Routes: routes, Relay: relay, Waker: nethernet.NewAPIWaker(cfg.ApiUrl, cfg.ApiToken, nil),
-		PublicAddr:     netip.AddrPortFrom(netip.MustParseAddr(cfg.PublicIp).Unmap(), uint16(cfg.UdpPort)),
-		GetCertificate: tlsGet, TLSDomains: cfg.TlsDomains, SignalPort: cfg.SignalPort, TrustedProxies: trusted,
-		WakeHold: cfg.WakeHold, ProbeTimeout: cfg.ProbeTimeout, MaxBody: maxBody,
-		PerIPRate: perIPRate, GlobalRate: globalRate, Identity: identity, Metrics: metrics,
-	})
+	opts := cfg.signalOptions()
+	opts.Routes, opts.Relay, opts.Waker = routes, relay, nethernet.NewAPIWaker(cfg.ApiUrl, cfg.ApiToken, nil)
+	opts.GetCertificate, opts.Identity, opts.Metrics = tlsGet, identity, metrics
+	server := nethernet.NewSignalServer(opts)
 
 	// In-flight signaling outlives ctx by up to shutdownGrace.
 	sigCtx, stopSignaling := context.WithCancel(context.Background())
@@ -295,6 +298,18 @@ func run(cfg *Config) error {
 		logrus.Warn("nethernet-router: grace period over; abandoning in-flight signaling")
 	}
 	return nil
+}
+
+// signalOptions carries the configuration into the signal server; run adds
+// the live parts (routes, relay, waker, certificate, identity, metrics).
+func (c *Config) signalOptions() nethernet.SignalOptions {
+	trusted, _ := c.trustedProxies() // validated
+	return nethernet.SignalOptions{
+		PublicAddr: netip.AddrPortFrom(netip.MustParseAddr(c.PublicIp).Unmap(), uint16(c.UdpPort)),
+		TLSDomains: c.TlsDomains, SignalPort: c.SignalPort, TrustedProxies: trusted,
+		WakeHold: c.WakeHold, ProbeTimeout: c.ProbeTimeout, MaxBody: c.MaxBody, RequestTimeout: c.RequestTimeout,
+		PerIPRate: c.SignalRatePerIp, GlobalRate: c.SignalRateGlobal,
+	}
 }
 
 func legacyPorts(cfg *Config) []int {

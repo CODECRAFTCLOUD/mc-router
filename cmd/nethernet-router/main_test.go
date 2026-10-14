@@ -12,6 +12,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +42,50 @@ func TestConfigDefaults(t *testing.T) {
 	assert.Equal(t, 30*time.Second, c.IdleTimeout)
 	assert.Equal(t, time.Duration(0), c.HardReap)
 	assert.Equal(t, ":8080", c.MetricsBinding)
+}
+
+// Spec §6.8: every limit is a flag. The signaling limits default to the values
+// they had as constants, and each flag reaches the signal server.
+func TestConfigSignalingLimitsReachSignalOptions(t *testing.T) {
+	base := []string{"--public-ip", "82.26.104.95", "--api-url", "http://api", "--api-token", "t"}
+	c, err := parseConfig(base)
+	require.NoError(t, err)
+	o := c.signalOptions()
+	assert.Equal(t, 5, o.PerIPRate)
+	assert.Equal(t, 200, o.GlobalRate)
+	assert.Equal(t, int64(1048576), o.MaxBody)
+	assert.Equal(t, 5*time.Second, o.RequestTimeout)
+
+	c, err = parseConfig(append(base, "--signal-rate-per-ip", "7", "--signal-rate-global", "300",
+		"--max-body", "65536", "--request-timeout", "8s"))
+	require.NoError(t, err)
+	o = c.signalOptions()
+	assert.Equal(t, 7, o.PerIPRate)
+	assert.Equal(t, 300, o.GlobalRate)
+	assert.Equal(t, int64(65536), o.MaxBody)
+	assert.Equal(t, 8*time.Second, o.RequestTimeout)
+
+	t.Setenv("NETHERNET_SIGNAL_RATE_PER_IP", "9")
+	t.Setenv("NETHERNET_SIGNAL_RATE_GLOBAL", "400")
+	t.Setenv("NETHERNET_MAX_BODY", "2048")
+	t.Setenv("NETHERNET_REQUEST_TIMEOUT", "3s")
+	c, err = parseConfig(base)
+	require.NoError(t, err)
+	o = c.signalOptions()
+	assert.Equal(t, 9, o.PerIPRate)
+	assert.Equal(t, 400, o.GlobalRate)
+	assert.Equal(t, int64(2048), o.MaxBody)
+	assert.Equal(t, 3*time.Second, o.RequestTimeout)
+}
+
+func TestConfigRejectsUnusableSignalingLimits(t *testing.T) {
+	base := []string{"--public-ip", "82.26.104.95", "--api-url", "http://api", "--api-token", "t"}
+	for _, bad := range [][]string{
+		{"--max-body", "0"}, {"--request-timeout", "0s"}, {"--signal-rate-per-ip", "-1"}, {"--signal-rate-global", "-1"},
+	} {
+		_, err := parseConfig(append(slices.Clone(base), bad...))
+		assert.ErrorContains(t, err, strings.TrimPrefix(bad[0], "--"), bad)
+	}
 }
 
 func TestConfigRejectsAHostnamePublicIP(t *testing.T) {

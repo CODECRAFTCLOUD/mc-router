@@ -151,7 +151,7 @@ func newSigFixture(t *testing.T) *sigFixture {
 	f.opts = SignalOptions{
 		Routes: f.routes, Relay: f.relay, Waker: f.waker, PublicAddr: netip.MustParseAddrPort(sigPublic),
 		TLSDomains: []string{"uniz.host", "mc.uniz.host"}, SignalPort: 19132,
-		WakeHold: 2 * time.Second, ProbeTimeout: 300 * time.Millisecond, MaxBody: 1 << 20,
+		WakeHold: 2 * time.Second, ProbeTimeout: 300 * time.Millisecond, MaxBody: 1 << 20, RequestTimeout: 5 * time.Second,
 		PerIPRate: 5, GlobalRate: 200, Identity: f.ident.v, Metrics: f.metrics,
 	}
 	f.awake()

@@ -25,9 +25,6 @@ import (
 )
 
 const (
-	// requestTimeout bounds the PROXY header, the TLS handshake and the whole
-	// request (headers and body) from the moment the connection is accepted.
-	requestTimeout = 5 * time.Second
 	// forwardTimeout bounds the backend's answer; the client waits 30 s in all,
 	// of which the wake hold takes 25.
 	forwardTimeout = 5 * time.Second
@@ -70,6 +67,7 @@ type SignalOptions struct {
 	WakeHold       time.Duration // from the accept, Verify included
 	ProbeTimeout   time.Duration // the readiness dial
 	MaxBody        int64
+	RequestTimeout time.Duration // PROXY header, TLS handshake and the whole request, from the accept
 	// PerIPRate (bursts to 4x) applies to a player's own address only; GlobalRate
 	// (bursts to 2x) to every connection. Per second; 0 disables a tier.
 	PerIPRate, GlobalRate int
@@ -119,7 +117,7 @@ type join struct {
 func (s *SignalServer) ServeConn(ctx context.Context, conn net.Conn, localPort int) {
 	j := &join{s: s, localPort: localPort, start: time.Now()}
 	defer conn.Close()
-	_ = conn.SetDeadline(j.start.Add(requestTimeout))
+	_ = conn.SetDeadline(j.start.Add(s.o.RequestTimeout))
 	j.conn, j.src, j.trusted = s.source(conn, localPort)
 	perIP := netip.Addr{} // the relay's address is shared by every player behind it
 	if j.trusted {
@@ -168,7 +166,7 @@ func (s *SignalServer) source(conn net.Conn, localPort int) (net.Conn, netip.Add
 	if !slices.ContainsFunc(s.o.TrustedProxies, func(p netip.Prefix) bool { return p.Contains(peer) }) {
 		return conn, peer, peer.IsValid()
 	}
-	// No header timeout of its own: conn's deadline (requestTimeout) bounds it.
+	// No header timeout of its own: conn's deadline (RequestTimeout) bounds it.
 	pc := proxyproto.NewConn(conn, proxyproto.WithPolicy(proxyproto.USE), proxyproto.SetReadHeaderTimeout(0))
 	if h := pc.ProxyHeader(); h != nil {
 		if a, ok := h.SourceAddr.(*net.TCPAddr); ok {
