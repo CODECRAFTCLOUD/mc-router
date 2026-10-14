@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -829,6 +830,60 @@ func TestSignalKeepsAWakeCountedWhenTheAPIGaveNoClearAnswer(t *testing.T) {
 		assert.Equal(t, 1, f.waker.count(), "the second join is over the player's limit, before the API")
 		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("player_limit")))
 	})
+}
+
+// Ruling C-6: a dial failure never reached the API, so nothing was woken and
+// the wake goes back to the player; nothing is cached either.
+func TestSignalHandsBackAWakeTheAPINeverReceived(t *testing.T) {
+	f := newSigFixture(t)
+	f.opts.WakeHold = 50 * time.Millisecond // never ready: the 6th join ends in 503 after its wake
+	f.asleep()
+	f.waker.result = func(call int) (WakeResult, error) {
+		if call <= 5 {
+			dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+			return WakeResult{}, fmt.Errorf("nethernet wake: %w", &url.Error{Op: "Post", URL: "http://uniz-api", Err: dial})
+		}
+		return WakeResult{Woken: true}, nil
+	}
+	addr := f.serve(t, 19132)
+	for i := range 6 {
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp, i)
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, i)
+	}
+	assert.Equal(t, 6, f.waker.count(), "5 dial failures did not use the player's 5 wakes")
+	assert.Equal(t, 5.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("refused")))
+	assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("player_limit")))
+}
+
+// The API received the request and the hold ran out before it answered: it
+// may still wake the server, so the wake stays counted (C-1, not C-6).
+func TestSignalKeepsAWakeCountedWhenTheAPITimedOutAfterTheRequest(t *testing.T) {
+	var got atomic.Int32
+	release := make(chan struct{})
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.Add(1)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(api.Close)
+	t.Cleanup(func() { close(release) }) // runs before api.Close, which waits for the handler
+	f := newSigFixture(t)
+	f.opts.WakesPerPlayer = 1
+	f.opts.WakeHold = 300 * time.Millisecond
+	f.opts.Waker = NewAPIWaker(api.URL, "t", api.Client())
+	f.asleep()
+	addr := f.serve(t, 19132)
+	for i := range 2 {
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp, i)
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, i)
+	}
+	assert.Equal(t, int32(1), got.Load(), "the second join is over the player's limit, before the API")
+	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")))
+	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("player_limit")))
 }
 
 func TestSignalAnswers503ForALegacyPortZeroWithoutCallingTheAPI(t *testing.T) {

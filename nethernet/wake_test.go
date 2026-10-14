@@ -3,6 +3,8 @@ package nethernet
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -93,6 +95,37 @@ func TestAPIWakerHonoursTheContext(t *testing.T) {
 	defer cancel()
 	_, err := NewAPIWaker(srv.URL, "t", srv.Client()).Wake(ctx, 1, wakeWho)
 	assert.Error(t, err)
+	assert.False(t, wakeNotSent(err), "a timeout after the request was sent: the API may still wake")
+}
+
+// Ruling C-6: the real client's error for a closed port is a dial failure.
+func TestAPIWakerDialFailureIsNotSent(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	url := "http://" + l.Addr().String()
+	require.NoError(t, l.Close())
+
+	_, err = NewAPIWaker(url, "t", nil).Wake(context.Background(), 1, wakeWho)
+	require.Error(t, err)
+	assert.True(t, wakeNotSent(err), "%v", err)
+}
+
+func TestWakeNotSent(t *testing.T) {
+	wrap := func(err error) error { return fmt.Errorf("nethernet wake: %w", err) }
+	for name, c := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"dial":         {wrap(&net.OpError{Op: "dial", Err: errors.New("refused")}), true},
+		"DNS":          {wrap(&net.DNSError{Err: "no such host", Name: "uniz-api"}), true},
+		"read":         {wrap(&net.OpError{Op: "read", Err: errors.New("reset")}), false},
+		"deadline":     {wrap(context.DeadlineExceeded), false},
+		"non-200":      {errors.New("nethernet wake: API returned 502"), false},
+		"nil":          {nil, false},
+		"dial, not %w": {fmt.Errorf("nethernet wake: %v", &net.OpError{Op: "dial", Err: errors.New("refused")}), false},
+	} {
+		assert.Equal(t, c.want, wakeNotSent(c.err), name)
+	}
 }
 
 func TestReadyFalseOnRefused(t *testing.T) {

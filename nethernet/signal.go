@@ -422,13 +422,16 @@ func (j *join) wake(ctx context.Context, req *http.Request, offer []byte, b Back
 			return refuse(http.StatusServiceUnavailable, "player_limit")
 		}
 		res, err = s.o.Waker.Wake(hold, b.LegacyPort, who)
-		// Only a clear answer (not woken) hands the wake back and is cached. On a
-		// failure (network, timeout, non-200, a hang-up) the API may still have
+		// Only a clear answer (not woken) hands the wake back and is cached. On
+		// another failure (timeout, non-200, a hang-up) the API may still have
 		// woken the server, so the wake stays counted (Ruling C-1) and the next
-		// join asks again.
+		// join asks again. A dial failure never reached the API, so it hands the
+		// wake back but caches nothing (Ruling C-6).
 		if err == nil && !res.Woken {
 			s.wakes.release(who.XUID, at)
 			s.backoff.put(b.LegacyPort, cachedWake{at: s.now(), res: res})
+		} else if wakeNotSent(err) {
+			s.wakes.release(who.XUID, at)
 		}
 	}
 	if err != nil && ctx.Err() != nil { // the player hung up during the API call

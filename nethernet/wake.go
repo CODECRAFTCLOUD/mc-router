@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -82,6 +83,15 @@ func (w *apiWaker) Wake(ctx context.Context, legacyPort int, who Identity) (Wake
 		return WakeResult{}, fmt.Errorf("nethernet wake: API refused: %s", out.Message)
 	}
 	return WakeResult{Woken: out.Woken, Booting: out.Booting, Message: out.Message}, nil
+}
+
+// wakeNotSent reports whether a Wake error happened before the request left
+// the router (a refused or unroutable dial, a DNS failure), so the API cannot
+// have woken anything (Ruling C-6).
+func wakeNotSent(err error) bool {
+	var op *net.OpError
+	var dns *net.DNSError
+	return errors.As(err, &op) && op.Op == "dial" || errors.As(err, &dns)
 }
 
 // Ready reports whether a TCP dial to addr succeeds within timeout.
