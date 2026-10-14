@@ -1341,6 +1341,17 @@ func TestSignalGivesUpOnAnAnswerThatNeverNamesThePod(t *testing.T) {
 	})
 }
 
+func TestSignalRefusesAMalformedOfferBeforeForwardingIt(t *testing.T) {
+	f := newSigFixture(t)
+	f.backend.setAnswer(func(n int32) string { return noPodAnswer(t, n) })
+	addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+	resp, body := sigDo(t, addr, sigReq{body: "v=0\r\nnot an offer\r\n"})
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.NotContains(t, body, "a=candidate")
+	assert.Equal(t, int32(0), f.backend.posts.Load(), "an offer the router can never register is never forwarded")
+}
+
 func TestSignalStopsRetryingWhenTheClientHangsUp(t *testing.T) {
 	f := newSigFixture(t)
 	f.opts.WakeHold = 10 * time.Second

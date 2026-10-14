@@ -502,6 +502,12 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		logrus.WithError(err).WithField("serverId", b.ServerID).Warn("nethernet: answer refused: " + why)
 		j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
 	}
+	off, err := ParseSDP(string(offer)) // an offer the router can never register is never forwarded
+	if err != nil {
+		b, _ := s.route(req.Host, j.localPort) // for the log's serverId only
+		fail(b, "offer", err)
+		return
+	}
 	retry, cancel := context.WithDeadline(ctx, j.start.Add(s.o.WakeHold))
 	defer cancel()
 	var (
@@ -521,7 +527,6 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		if forwards > 1 {
 			fctx = retry
 		}
-		var err error
 		resp, answer, err = s.forward(fctx, b, req, offer)
 		if err != nil {
 			logrus.WithError(err).WithFields(logrus.Fields{"serverId": b.ServerID, "forwards": forwards}).Debug("nethernet: offer forward failed")
@@ -565,11 +570,6 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 			fail(b, "no candidate at the pod address", fmt.Errorf("pods %v, answer candidates %v, forwards %d", b.PodIPs, cands, forwards))
 			return
 		}
-	}
-	off, err := ParseSDP(string(offer))
-	if err != nil {
-		fail(b, "offer", err)
-		return
 	}
 	rewritten, err := RewriteAnswer(string(answer), s.o.PublicAddr)
 	if err != nil {
