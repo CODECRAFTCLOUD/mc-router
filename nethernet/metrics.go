@@ -67,3 +67,21 @@ func (m *Metrics) queueFull() {
 		m.RegistryQueueFull.Inc()
 	}
 }
+
+func (m *Metrics) signal(result string) {
+	if m != nil {
+		m.SignalingRequests.WithLabelValues(result).Inc()
+	}
+}
+
+func (m *Metrics) tlsHandshake(outcome string) {
+	if m != nil {
+		m.TLSHandshakes.WithLabelValues(outcome).Inc()
+	}
+}
+
+func (m *Metrics) wakeHold(outcome string) {
+	if m != nil {
+		m.WakeHolds.WithLabelValues(outcome).Inc()
+	}
+}
