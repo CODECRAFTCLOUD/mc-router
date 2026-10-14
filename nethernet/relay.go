@@ -46,7 +46,7 @@ type relaySession struct {
 	s          Session
 	created    time.Time
 	upstream   *net.UDPConn   // nil while signaled; set once under Relay.mu
-	client     netip.AddrPort // guarded by Relay.mu; invalid once the address moved to another pair
+	client     netip.AddrPort // guarded by Relay.mu
 	lastSeen   atomic.Int64   // unix nanos of the last client datagram
 	lastShared atomic.Int64   // unix nanos of the last shared-registry refresh
 
@@ -143,8 +143,10 @@ func (r *Relay) handle(ctx context.Context, from netip.AddrPort, pkt []byte) {
 	r.mu.Unlock()
 	if rs != nil { // DTLS records, alerts included, are never inspected
 		if IsSTUN(pkt) {
-			if pair, ok := STUNUsername(pkt); ok && pair != rs.pair { // a new join from a reused address
-				r.bindFromSTUN(ctx, from, pkt)
+			// Never move a bound address to another pair: a spoofed source with
+			// credentials for the attacker's own pair would cut the victim's session.
+			if pair, ok := STUNUsername(pkt); ok && pair != rs.pair {
+				r.opt.Metrics.dropped("pair_mismatch")
 				return
 			}
 		}
@@ -294,7 +296,8 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 			return nil, "unknown_peer"
 		}
 		delete(r.byClient, rs.client)
-		r.moveClientLocked(client, rs)
+		rs.client = client
+		r.byClient[client] = rs
 		return rs, ""
 	}
 	if rs == nil { // signaled on another replica: it counts here once it binds
@@ -310,7 +313,8 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 	}
 	rs.upstream = up
 	rs.lastSeen.Store(time.Now().UnixNano())
-	r.moveClientLocked(client, rs)
+	rs.client = client
+	r.byClient[client] = rs
 	r.opt.Metrics.session(s.ServerID, "signaled", -1)
 	r.opt.Metrics.session(s.ServerID, "bound", 1)
 	go r.pipeUpstream(rs)
@@ -329,16 +333,6 @@ func (r *Relay) addLocked(pair string, s Session) *relaySession {
 	r.perServer[s.ServerID]++
 	r.opt.Metrics.session(s.ServerID, "signaled", 1)
 	return rs
-}
-
-// moveClientLocked points client at rs. A session the address leaves keeps
-// its upstream until reaped but answers no one. Callers hold mu.
-func (r *Relay) moveClientLocked(client netip.AddrPort, rs *relaySession) {
-	if prev := r.byClient[client]; prev != nil && prev != rs {
-		prev.client = netip.AddrPort{}
-	}
-	rs.client = client
-	r.byClient[client] = rs
 }
 
 // queuePublish writes rs's binding to the shared registry on a worker. Writes
@@ -423,9 +417,6 @@ func (r *Relay) pipeUpstream(rs *relaySession) {
 		r.mu.Lock()
 		client := rs.client
 		r.mu.Unlock()
-		if !client.IsValid() {
-			continue
-		}
 		if _, err := r.conn.WriteToUDPAddrPort(buf[:n], client); err != nil {
 			logrus.WithError(err).Debug("nethernet relay: client write failed")
 		}
