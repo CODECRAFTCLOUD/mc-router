@@ -23,6 +23,9 @@ type Session struct {
 	// on the main listener). On the legacy listener every player arrives from the
 	// relay's address, so it is false there and no per-IP cap applies.
 	SignalIPTrusted bool `json:"signalIpTrusted"`
+	// CreatedAt is set by Relay.Register (UTC) and travels with the session, so
+	// HardReap measures from the first signal on every replica that adopts it.
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 // Registry maps an ICE ufrag pair ("serverUfrag:clientUfrag") to its Session

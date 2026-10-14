@@ -55,8 +55,7 @@ type ipServer struct {
 // upstream socket to BDS and the client address it currently answers to.
 type relaySession struct {
 	pair        string
-	s           Session
-	created     time.Time
+	s           Session        // s.CreatedAt is the session's age on every replica
 	upstream    *net.UDPConn   // nil while signaled; set once under Relay.mu
 	ipKey       ipServer       // guarded by Relay.mu, with countsForIP
 	countsForIP bool           // counted in Relay.perIP
@@ -112,7 +111,10 @@ func (r *Relay) Register(ctx context.Context, pair string, s Session) error {
 		return ErrInvalidSignalIP
 	}
 	r.mu.Lock()
-	if r.byPair[pair] == nil {
+	if rs := r.byPair[pair]; rs != nil {
+		s.CreatedAt = rs.s.CreatedAt
+	} else {
+		s.CreatedAt = time.Now().UTC()
 		key := ipServer{ipKey(s.SignalIP), s.ServerID}
 		if !r.roomLocked(s.ServerID) || s.SignalIPTrusted && r.perIP[key] >= r.opt.MaxPerIPPerServer {
 			r.mu.Unlock()
@@ -329,6 +331,9 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 		return rs, ""
 	}
 	if rs == nil { // signaled on another replica: it counts here once it binds
+		if r.opt.HardReap > 0 && time.Since(s.CreatedAt) > r.opt.HardReap {
+			return nil, "unknown_peer" // hard-reaped: never adopted again with a fresh age
+		}
 		if !r.roomLocked(s.ServerID) {
 			return nil, "session_cap"
 		}
@@ -356,7 +361,7 @@ func (r *Relay) roomLocked(server string) bool {
 
 // addLocked records a signaled session. Callers hold mu.
 func (r *Relay) addLocked(pair string, s Session) *relaySession {
-	rs := &relaySession{pair: pair, s: s, created: time.Now()}
+	rs := &relaySession{pair: pair, s: s}
 	r.byPair[pair] = rs
 	r.perServer[s.ServerID]++
 	r.opt.Metrics.session(s.ServerID, "signaled", 1)
@@ -476,7 +481,7 @@ func (r *Relay) reap(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for pair, rs := range r.byPair {
-		age := now.Sub(rs.created)
+		age := now.Sub(rs.s.CreatedAt)
 		switch {
 		case r.opt.HardReap > 0 && age > r.opt.HardReap,
 			rs.upstream == nil && age > r.opt.UnboundTTL,

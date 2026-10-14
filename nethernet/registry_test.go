@@ -49,7 +49,8 @@ func newTestRedisRegistry(t *testing.T, addr string) Registry {
 }
 
 var testSession = Session{ServerID: "srv-1", Target: netip.MustParseAddrPort("10.0.0.3:19140"), IcePwd: testPwd,
-	SignalIP: netip.MustParseAddr("198.51.100.7"), SignalIPTrusted: true}
+	SignalIP: netip.MustParseAddr("198.51.100.7"), SignalIPTrusted: true,
+	CreatedAt: time.Date(2026, 10, 14, 1, 2, 3, 4000, time.UTC)}
 
 func TestRegistryRoundTrip(t *testing.T) {
 	for _, tc := range registryCases(t) {
@@ -136,7 +137,7 @@ func TestRedisRegistryKeys(t *testing.T) {
 	assert.Equal(t, time.Minute, mr.TTL("nn:sess:2c69:QXyz"))
 	sess, err := mr.Get("nn:sess:2c69:QXyz")
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"serverId":"srv-1","target":"10.0.0.3:19140","icePwd":"`+testPwd+`","signalIp":"198.51.100.7","signalIpTrusted":true}`, sess)
+	assert.JSONEq(t, `{"serverId":"srv-1","target":"10.0.0.3:19140","icePwd":"`+testPwd+`","signalIp":"198.51.100.7","signalIpTrusted":true,"createdAt":"2026-10-14T01:02:03.000004Z"}`, sess)
 	got, err := mr.Get("nn:client:203.0.113.7:50000")
 	require.NoError(t, err)
 	assert.Equal(t, "2c69:QXyz", got)
