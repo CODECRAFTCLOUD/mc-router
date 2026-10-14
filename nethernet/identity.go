@@ -29,7 +29,9 @@ const (
 	identityIssuer   = "https://authorization.franchise.minecraft-services.net/"
 	identityAudience = "api://auth-minecraft-services/multiplayer"
 	identitySkew     = 60 * time.Second
-	jwksRefetchEvery = time.Minute
+	jwksRefetchEvery = time.Minute      // unknown-kid refetch limit while keys are cached
+	jwksRetryEmpty   = 5 * time.Second  // retry floor while no keys are cached (R35)
+	jwksFetchTimeout = 10 * time.Second // a fetch's own bound, whatever the caller's ctx
 )
 
 var errIdentity = errors.New("identity rejected")
@@ -245,7 +247,8 @@ func verifyFingerprints(jws string, fps []sdpFingerprint, cpk *ecdsa.PublicKey) 
 }
 
 // key returns the JWKS key for kid. An unknown kid refetches the JWKS at most
-// once per jwksRefetchEvery; a failed fetch keeps the cached keys.
+// once per jwksRefetchEvery (every jwksRetryEmpty while no keys are cached); a
+// failed fetch keeps the cached keys.
 func (v *IdentityVerifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	if k := v.cachedKey(kid); k != nil {
 		return k, nil
@@ -256,17 +259,14 @@ func (v *IdentityVerifier) key(ctx context.Context, kid string) (*rsa.PublicKey,
 		return k, nil
 	}
 	v.mu.RLock()
-	last := v.lastFetch
+	last, empty := v.lastFetch, len(v.keys) == 0
 	v.mu.RUnlock()
-	if now := v.now(); last.IsZero() || now.Sub(last) >= jwksRefetchEvery {
-		keys, err := v.fetchJWKS(ctx)
-		v.mu.Lock()
-		v.lastFetch = now
-		if err == nil {
-			v.keys = keys
-		}
-		v.mu.Unlock()
-		if err != nil {
+	every := jwksRefetchEvery
+	if empty {
+		every = jwksRetryEmpty
+	}
+	if last.IsZero() || v.now().Sub(last) >= every {
+		if err := v.fetchLocked(ctx); err != nil {
 			logrus.WithError(err).Warn("nethernet: JWKS fetch failed; keeping cached keys")
 		}
 	}
@@ -274,12 +274,40 @@ func (v *IdentityVerifier) key(ctx context.Context, kid string) (*rsa.PublicKey,
 		return k, nil
 	}
 	v.mu.RLock()
-	empty := len(v.keys) == 0
+	empty = len(v.keys) == 0
 	v.mu.RUnlock()
 	if empty {
 		return nil, identityErr("no Minecraft signing keys loaded")
 	}
 	return nil, identityErr("token signed by an unknown key")
+}
+
+// Refresh fetches the JWKS now, whatever the refetch limit. On failure it keeps
+// the cached keys and returns the error. The router calls it once at start
+// (non-fatal: Verify still fetches lazily) and every 6 h after that, so a key
+// Microsoft removes stops being trusted without waiting for an unknown kid.
+func (v *IdentityVerifier) Refresh(ctx context.Context) error {
+	v.fetchMu.Lock()
+	defer v.fetchMu.Unlock()
+	return v.fetchLocked(ctx)
+}
+
+// fetchLocked runs one JWKS fetch; the caller holds fetchMu. The fetch is
+// shared by every player, so it runs detached from the caller's ctx under its
+// own timeout: a request that is cancelled or times out never fails it, and so
+// never spends the refetch window for everyone else (R35).
+func (v *IdentityVerifier) fetchLocked(ctx context.Context) error {
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jwksFetchTimeout)
+	defer cancel()
+	now := v.now()
+	keys, err := v.fetchJWKS(fctx)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.lastFetch = now
+	if err == nil {
+		v.keys = keys
+	}
+	return err
 }
 
 func (v *IdentityVerifier) cachedKey(kid string) *rsa.PublicKey {

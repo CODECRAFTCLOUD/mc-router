@@ -71,11 +71,27 @@ type identJWKS struct {
 	srv     *httptest.Server
 	fetches atomic.Int32
 	down    atomic.Bool
+	body    atomic.Pointer[[]byte]
 }
 
 func identServeJWKS(t *testing.T, keys map[string]*rsa.PublicKey) *identJWKS {
 	t.Helper()
 	j := &identJWKS{}
+	j.setKeys(keys)
+	j.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		j.fetches.Add(1)
+		if j.down.Load() {
+			http.Error(w, "down", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write(*j.body.Load())
+	}))
+	t.Cleanup(j.srv.Close)
+	return j
+}
+
+// setKeys replaces the key set the JWKS serves (a Microsoft key rotation).
+func (j *identJWKS) setKeys(keys map[string]*rsa.PublicKey) {
 	var set struct {
 		Keys []map[string]string `json:"keys"`
 	}
@@ -87,17 +103,10 @@ func identServeJWKS(t *testing.T, keys map[string]*rsa.PublicKey) *identJWKS {
 		})
 	}
 	body, err := json.Marshal(set)
-	require.NoError(t, err)
-	j.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		j.fetches.Add(1)
-		if j.down.Load() {
-			http.Error(w, "down", http.StatusServiceUnavailable)
-			return
-		}
-		_, _ = w.Write(body)
-	}))
-	t.Cleanup(j.srv.Close)
-	return j
+	if err != nil {
+		panic(err)
+	}
+	j.body.Store(&body)
 }
 
 func identB64(v any) string {
@@ -437,4 +446,62 @@ func TestIdentityRejectsAFingerprintsHeaderThatIsNotES384(t *testing.T) {
 	jws := identFingerprintsJWS(identCPK, "ES256", identFingerprintA)
 	_, err := f.v.Verify(context.Background(), identOffer(t, identEnvelope(token, jws), identFingerprintA))
 	assert.Error(t, err)
+}
+
+// R35: a JWKS fetch is shared state and must not die with one player's request.
+func TestIdentityACancelledRequestDoesNotBlockTheNextFetch(t *testing.T) {
+	f := identSetup(t)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = f.v.Verify(cancelled, f.offer(t, nil)) // a player who hung up, on a cold replica
+
+	f.clock.add(10 * time.Second) // well inside the minute
+	_, err := f.v.Verify(context.Background(), f.offer(t, nil))
+	assert.NoError(t, err, "the next player still verifies")
+}
+
+func TestIdentityRetriesSoonerWithNoKeys(t *testing.T) {
+	f := identSetup(t)
+	f.jwks.down.Store(true)
+	_, err := f.v.Verify(context.Background(), f.offer(t, nil))
+	assert.Error(t, err)
+	assert.EqualValues(t, 1, f.jwks.fetches.Load())
+
+	f.clock.add(4 * time.Second)
+	_, err = f.v.Verify(context.Background(), f.offer(t, nil))
+	assert.Error(t, err)
+	assert.EqualValues(t, 1, f.jwks.fetches.Load(), "an empty cache still waits 5 s between fetches")
+
+	f.jwks.down.Store(false)
+	f.clock.add(time.Second)
+	_, err = f.v.Verify(context.Background(), f.offer(t, nil))
+	assert.NoError(t, err, "with no keys the retry comes after 5 s, not a minute")
+	assert.EqualValues(t, 2, f.jwks.fetches.Load())
+}
+
+func TestIdentityRefreshKeepsCachedKeysOnFailure(t *testing.T) {
+	f := identSetup(t)
+	require.NoError(t, f.v.Refresh(context.Background()))
+	assert.EqualValues(t, 1, f.jwks.fetches.Load())
+
+	f.jwks.down.Store(true)
+	assert.Error(t, f.v.Refresh(context.Background()))
+	assert.EqualValues(t, 2, f.jwks.fetches.Load(), "Refresh fetches now, whatever the refetch limit")
+	_, err := f.v.Verify(context.Background(), f.offer(t, nil))
+	assert.NoError(t, err, "the cached key still verifies")
+}
+
+func TestIdentityRefreshPicksUpARotatedKey(t *testing.T) {
+	f := identSetup(t)
+	_, err := f.v.Verify(context.Background(), f.offer(t, nil)) // warms the cache with kid-1
+	require.NoError(t, err)
+
+	f.jwks.setKeys(map[string]*rsa.PublicKey{"kid-2": &identOtherRSA.PublicKey}) // kid-1 rotated out
+	require.NoError(t, f.v.Refresh(context.Background()))                        // inside the minute
+
+	token := identToken(map[string]any{"alg": "RS256", "kid": "kid-2"}, identDefaultClaims(f.clock), identOtherRSA)
+	_, err = f.v.Verify(context.Background(), identOffer(t, identEnvelope(token, identFingerprintsJWS(identCPK, "ES384", identFingerprintA)), identFingerprintA))
+	assert.NoError(t, err, "the new key verifies")
+	_, err = f.v.Verify(context.Background(), f.offer(t, nil))
+	assert.Error(t, err, "a key Microsoft removed is no longer trusted")
 }
