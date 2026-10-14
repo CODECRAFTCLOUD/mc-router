@@ -13,11 +13,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -574,6 +576,37 @@ func TestSignalLimitsWakesPerPlayer(t *testing.T) {
 	resp, _ = sigDo(t, addr, sigReq{body: f.offerFor(t, "2535400000000888")})
 	require.NotNil(t, resp)
 	assert.Equal(t, 8, f.waker.count(), "another player still wakes")
+}
+
+// R34 is a rolling hour: a wake stops counting an hour after it.
+func TestWakeLimiterForgetsAWakeAfterAnHour(t *testing.T) {
+	l := &wakeLimiter{byXUID: map[string][]time.Time{}}
+	t0 := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	for i := range wakesPerPlayer {
+		_, ok := l.reserve("x", t0.Add(time.Duration(i)*time.Minute))
+		require.True(t, ok, i)
+	}
+	_, ok := l.reserve("x", t0.Add(59*time.Minute))
+	assert.False(t, ok, "the 6th wake inside the hour is refused")
+	_, ok = l.reserve("x", t0.Add(time.Hour))
+	assert.True(t, ok, "an hour after the first wake, it no longer counts")
+	_, ok = l.reserve("x", t0.Add(time.Hour+30*time.Second))
+	assert.False(t, ok, "the second wake still counts until its own hour is up")
+}
+
+// The minute sweep drops players with no wake in the last hour, so the map
+// holds only players seen this hour.
+func TestWakeLimiterSweepsPlayersWithNoWakeThisHour(t *testing.T) {
+	l := &wakeLimiter{byXUID: map[string][]time.Time{}}
+	t0 := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	l.reserve("old", t0)
+	l.reserve("recent", t0.Add(30*time.Minute))
+	l.reserve("new", t0.Add(time.Hour+time.Minute))
+	assert.ElementsMatch(t, []string{"recent", "new"}, slices.Collect(maps.Keys(l.byXUID)), "an hour-old player is swept")
+
+	l.reserve("late", t0.Add(time.Hour+time.Minute+30*time.Second+30*time.Minute))
+	assert.Contains(t, l.byXUID, "late")
+	assert.NotContains(t, l.byXUID, "recent", "swept once its wake is an hour old")
 }
 
 func TestSignalAnswers503ForALegacyPortZeroWithoutCallingTheAPI(t *testing.T) {
