@@ -932,3 +932,63 @@ func TestRelayRetriesASkippedSharedWriteAfterABackoff(t *testing.T) {
 	assert.Equal(t, 2.0, testutil.ToFloat64(m.RegistryQueueFull))
 	assert.Len(t, r.jobs, sharedQueue, "the retry took the free slot")
 }
+
+// slowClientRegistry answers client lookups only when their context ends, like
+// a shared registry swamped by a flood of them; session lookups stay fast.
+type slowClientRegistry struct{ Registry }
+
+func (slowClientRegistry) LookupClient(ctx context.Context, _ netip.AddrPort) (string, bool, error) {
+	<-ctx.Done()
+	return "", false, ctx.Err()
+}
+
+// Review I-2 (probe B): DTLS-shaped junk from many source ports fills the
+// client-lookup queue, and a session signaled on another replica is still
+// adopted at once, because session lookups have a budget, queue and workers of
+// their own.
+func TestRelayAdoptsASessionUnderAClientLookupFlood(t *testing.T) {
+	bds := startBDS(t)
+	_, redisReg := sharedRedis(t)
+	shared := slowClientRegistry{redisReg}
+	s := session(bds)
+	s.CreatedAt = time.Now().UTC()
+	require.NoError(t, shared.PutSession(t.Context(), testPair, s, time.Minute)) // signaled on replica A
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	m := NewMetrics(prometheus.NewRegistry())
+	r, err := NewRelay(conn, NewMemoryRegistry(), shared, defaultOpts(m))
+	require.NoError(t, err)
+	for i := range sharedQueue + 64 { // the read loop's view of the flood, before any worker runs
+		r.handle(t.Context(), netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(20000+i)), dtlsData)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = r.Serve(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done; _ = conn.Close() })
+
+	start := time.Now()
+	retransmit(t, newClient(t), conn.LocalAddr().(*net.UDPAddr).AddrPort(), signedBinding(testPair, testPwd), bds)
+	assert.Less(t, time.Since(start), time.Second, "the join's first check waited behind the flood")
+	assert.Equal(t, 64.0, testutil.ToFloat64(m.LookupsDropped.WithLabelValues("c")), "each client lookup the full queue refused is counted")
+	assert.Equal(t, 0.0, testutil.ToFloat64(m.LookupsDropped.WithLabelValues("s")))
+}
+
+// Every lookup dropped because its kind's key budget is spent is counted too.
+func TestRelayCountsALookupPastItsKeyBudget(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer conn.Close()
+	m := NewMetrics(prometheus.NewRegistry())
+	r, err := NewRelay(conn, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(m))
+	require.NoError(t, err)
+	from := netip.MustParseAddrPort("192.0.2.1:20000")
+	for i := range maxLookupKeys { // no Serve: the test drains the queue itself
+		r.handle(t.Context(), from, signedBinding(fmt.Sprintf("%05d:QXyz", i), testPwd))
+		r.sessionLookups.lookedUntil = time.Now().Add(time.Hour) // one window for the whole loop
+		<-r.sessionLookups.jobs
+	}
+	r.handle(t.Context(), from, signedBinding("extra:QXyz", testPwd))
+	assert.Equal(t, 1.0, testutil.ToFloat64(m.LookupsDropped.WithLabelValues("s")), "the key past the budget is counted")
+	assert.Equal(t, 0.0, testutil.ToFloat64(m.LookupsDropped.WithLabelValues("c")))
+}

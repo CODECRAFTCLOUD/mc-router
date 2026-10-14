@@ -17,12 +17,15 @@ const (
 	registryTimeout = 250 * time.Millisecond
 	// Shared-registry work runs on a few workers behind a bounded queue, never on
 	// the read loop: a full queue drops the job; lookups retry on the client's
-	// retransmit, publishes on the next datagram after sharedRetry.
+	// retransmit, publishes on the next datagram after sharedRetry. Session
+	// lookups (by STUN username) have workers and a queue of these sizes of their
+	// own, apart from client lookups and publishes (review I-2).
 	sharedWorkers = 4
 	sharedQueue   = 256
 	sharedRetry   = time.Second
 	// A key is looked up at most once per 1-2 s (de-dup while in flight plus a
-	// negative cache), and at most maxLookupKeys distinct keys per window.
+	// negative cache), and at most maxLookupKeys distinct keys per window, for
+	// each kind of lookup.
 	lookupWindow  = time.Second
 	maxLookupKeys = 4096
 	// A STUN USERNAME of maxUsername bytes or more is dropped: RFC 5389 section
@@ -92,8 +95,17 @@ type Relay struct {
 	// on the replica that handled the POST, for as long as the session lives here.
 	perIP map[ipServer]int
 
+	jobs chan func(context.Context) // client lookups and publishes
+	// A flood of client lookups (any DTLS-shaped junk from many source ports)
+	// must not delay a join's first check, which needs a session lookup.
+	clientLookups, sessionLookups lookupBudget
+}
+
+// lookupBudget bounds one kind of shared-registry lookup. Read loop only.
+type lookupBudget struct {
+	kind string // the metric label: "s" (session by STUN username) or "c" (client by address)
 	jobs chan func(context.Context)
-	// Keys looked up in this window and the previous one. Read loop only.
+	// Keys looked up in this window and the previous one.
 	looked, lookedPrev map[string]struct{}
 	lookedUntil        time.Time
 }
@@ -104,10 +116,13 @@ func NewRelay(conn *net.UDPConn, local Registry, shared Registry, opt RelayOptio
 	if opt.UnboundTTL <= 0 || opt.IdleTimeout <= 0 || opt.HardReap < 0 || opt.MaxSessions <= 0 || opt.MaxSessionsPerServer <= 0 || opt.MaxPerIPPerServer <= 0 {
 		return nil, errors.New("nethernet relay: UnboundTTL, IdleTimeout, MaxSessions, MaxSessionsPerServer and MaxPerIPPerServer must be > 0, HardReap >= 0")
 	}
-	return &Relay{conn: conn, local: local, shared: shared, opt: opt, epoch: time.Now(),
+	r := &Relay{conn: conn, local: local, shared: shared, opt: opt, epoch: time.Now(),
 		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{}, perServer: map[string]int{},
 		perIP: map[ipServer]int{},
-		jobs:  make(chan func(context.Context), sharedQueue)}, nil
+		jobs:  make(chan func(context.Context), sharedQueue)}
+	r.clientLookups = lookupBudget{kind: "c", jobs: r.jobs}
+	r.sessionLookups = lookupBudget{kind: "s", jobs: make(chan func(context.Context), sharedQueue)}
+	return r, nil
 }
 
 // Register records a signaled session here, locally and in the shared registry.
@@ -165,7 +180,8 @@ func (r *Relay) Serve(ctx context.Context) error {
 	defer r.closeAll()
 	go r.reapLoop(ctx)
 	for range sharedWorkers {
-		go r.work(ctx)
+		go r.work(ctx, r.jobs)
+		go r.work(ctx, r.sessionLookups.jobs)
 	}
 	buf := make([]byte, 64*1024)
 	for {
@@ -220,7 +236,7 @@ func (r *Relay) bindFromSTUN(ctx context.Context, from netip.AddrPort, pkt []byt
 	}
 	s, ok := r.knownSession(ctx, pair)
 	if !ok {
-		r.queueLookup("s:"+pair, func(ctx context.Context) { r.fetchSession(ctx, pair) })
+		r.queueLookup(&r.sessionLookups, pair, func(ctx context.Context) { r.fetchSession(ctx, pair) })
 		r.opt.Metrics.dropped("unknown_peer")
 		return
 	}
@@ -243,7 +259,7 @@ func (r *Relay) bindFromKnownClient(ctx context.Context, from netip.AddrPort, pk
 		}
 	}
 	if len(pkt) > 0 && pkt[0] >= 20 && pkt[0] <= 63 {
-		r.queueLookup("c:"+from.String(), func(ctx context.Context) { r.fetchClient(ctx, from) })
+		r.queueLookup(&r.clientLookups, from.String(), func(ctx context.Context) { r.fetchClient(ctx, from) })
 	}
 	r.opt.Metrics.dropped("unknown_peer")
 }
@@ -260,34 +276,41 @@ func (r *Relay) knownSession(ctx context.Context, pair string) (Session, bool) {
 	return s, err == nil && ok
 }
 
-// queueLookup hands a shared-registry lookup to the workers unless key was
-// queued in this window or the last. Read loop only; never blocks.
-func (r *Relay) queueLookup(key string, job func(context.Context)) {
+// queueLookup hands a shared-registry lookup to b's workers unless key was
+// queued in this window or the last. A lookup dropped because b's budget or
+// queue is full is counted by kind; the retransmit retries. Read loop only;
+// never blocks.
+func (r *Relay) queueLookup(b *lookupBudget, key string, job func(context.Context)) {
 	if r.shared == nil {
 		return
 	}
-	if now := time.Now(); now.After(r.lookedUntil) {
-		r.lookedPrev, r.looked, r.lookedUntil = r.looked, map[string]struct{}{}, now.Add(lookupWindow)
+	if now := time.Now(); now.After(b.lookedUntil) {
+		b.lookedPrev, b.looked, b.lookedUntil = b.looked, map[string]struct{}{}, now.Add(lookupWindow)
 	}
-	if _, ok := r.looked[key]; ok {
+	if _, ok := b.looked[key]; ok {
 		return
 	}
-	if _, ok := r.lookedPrev[key]; ok || len(r.looked) >= maxLookupKeys {
+	if _, ok := b.lookedPrev[key]; ok {
+		return
+	}
+	if len(b.looked) >= maxLookupKeys {
+		r.opt.Metrics.lookupDropped(b.kind)
 		return
 	}
 	select {
-	case r.jobs <- job:
-		r.looked[key] = struct{}{}
-	default: // queue full: the retransmit retries
+	case b.jobs <- job:
+		b.looked[key] = struct{}{}
+	default:
+		r.opt.Metrics.lookupDropped(b.kind)
 	}
 }
 
-func (r *Relay) work(ctx context.Context) {
+func (r *Relay) work(ctx context.Context, jobs <-chan func(context.Context)) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case job := <-r.jobs:
+		case job := <-jobs:
 			job(ctx)
 		}
 	}

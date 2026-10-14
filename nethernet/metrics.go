@@ -13,6 +13,7 @@ type Metrics struct {
 	UDPDropped        *prometheus.CounterVec // reason
 	RegistryErrors    prometheus.Counter
 	RegistryQueueFull prometheus.Counter
+	LookupsDropped    *prometheus.CounterVec // kind (s, c)
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -39,8 +40,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "nethernet_registry_queue_full_total",
 			Help: "Shared-registry writes skipped because the worker queue was full; the datagram is still forwarded.",
 		}),
+		LookupsDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "nethernet_registry_lookups_dropped_total",
+			Help: "Shared-registry lookups skipped because their budget or queue was full, by kind (s: session by STUN username, c: client by address); the client's retransmit retries.",
+		}, []string{"kind"}),
 	}
-	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors, m.RegistryQueueFull)
+	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors, m.RegistryQueueFull, m.LookupsDropped)
 	return m
 }
 
@@ -65,6 +70,12 @@ func (m *Metrics) session(server, state string, delta float64) {
 func (m *Metrics) queueFull() {
 	if m != nil {
 		m.RegistryQueueFull.Inc()
+	}
+}
+
+func (m *Metrics) lookupDropped(kind string) {
+	if m != nil {
+		m.LookupsDropped.WithLabelValues(kind).Inc()
 	}
 }
 
