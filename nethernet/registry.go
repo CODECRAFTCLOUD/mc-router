@@ -12,11 +12,12 @@ import (
 )
 
 // Session is what the relay needs to forward one join: where BDS listens and
-// the ICE password that signs the client's connectivity checks.
+// the ICE password that signs the client's connectivity checks. Stored as the
+// spec 6.5 JSON {serverId, target, icePwd}.
 type Session struct {
-	ServerID string
-	Target   netip.AddrPort
-	IcePwd   string
+	ServerID string         `json:"serverId"`
+	Target   netip.AddrPort `json:"target"`
+	IcePwd   string         `json:"icePwd"`
 }
 
 // Registry maps an ICE ufrag pair ("serverUfrag:clientUfrag") to its Session
@@ -26,6 +27,7 @@ type Registry interface {
 	GetSession(ctx context.Context, pair string) (Session, bool, error)
 	BindClient(ctx context.Context, client netip.AddrPort, pair string, ttl time.Duration) error
 	LookupClient(ctx context.Context, client netip.AddrPort) (string, bool, error)
+	DeleteClient(ctx context.Context, client netip.AddrPort) error
 }
 
 type memEntry[T any] struct {
@@ -98,11 +100,25 @@ func (m *memoryRegistry) LookupClient(_ context.Context, client netip.AddrPort) 
 	return e.v, true, nil
 }
 
+func (m *memoryRegistry) DeleteClient(_ context.Context, client netip.AddrPort) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.clients, client)
+	return nil
+}
+
 type redisRegistry struct{ c *redis.Client }
 
 // NewRedisRegistry shares sessions across router replicas: keys nn:sess:<pair>
-// (JSON Session) and nn:client:<ip:port> (pair), both with a TTL.
-func NewRedisRegistry(c *redis.Client) Registry { return &redisRegistry{c} }
+// (JSON Session) and nn:client:<ip:port> (pair), both with a TTL. The client
+// must set ContextTimeoutEnabled: without it go-redis ignores context deadlines
+// and a hung server holds every call for ReadTimeout (5 s by default).
+func NewRedisRegistry(c *redis.Client) (Registry, error) {
+	if !c.Options().ContextTimeoutEnabled {
+		return nil, errors.New("nethernet: the redis client must set ContextTimeoutEnabled")
+	}
+	return &redisRegistry{c}, nil
+}
 
 func (r *redisRegistry) PutSession(ctx context.Context, pair string, s Session, ttl time.Duration) error {
 	b, err := json.Marshal(s)
@@ -140,4 +156,8 @@ func (r *redisRegistry) LookupClient(ctx context.Context, client netip.AddrPort)
 		return "", false, err
 	}
 	return pair, true, nil
+}
+
+func (r *redisRegistry) DeleteClient(ctx context.Context, client netip.AddrPort) error {
+	return r.c.Del(ctx, "nn:client:"+client.String()).Err()
 }

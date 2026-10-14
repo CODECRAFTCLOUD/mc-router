@@ -33,12 +33,19 @@ type registryCase struct {
 func registryCases(t *testing.T) []registryCase {
 	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	mr := miniredis.RunT(t)
-	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = rc.Close() })
 	return []registryCase{
 		{"memory", newMemoryRegistry(clock.now), clock.advance},
-		{"redis", NewRedisRegistry(rc), mr.FastForward},
+		{"redis", newTestRedisRegistry(t, mr.Addr()), mr.FastForward},
 	}
+}
+
+// newTestRedisRegistry builds the registry the way B4 must: with context timeouts on.
+func newTestRedisRegistry(t *testing.T, addr string) Registry {
+	rc := redis.NewClient(&redis.Options{Addr: addr, ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rc.Close() })
+	reg, err := NewRedisRegistry(rc)
+	require.NoError(t, err)
+	return reg
 }
 
 var testSession = Session{ServerID: "srv-1", Target: netip.MustParseAddrPort("10.0.0.3:19140"), IcePwd: testPwd}
@@ -97,15 +104,38 @@ func TestRegistryBindAndLookupClient(t *testing.T) {
 	}
 }
 
+func TestRegistryDeleteClient(t *testing.T) {
+	for _, tc := range registryCases(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			client := netip.MustParseAddrPort("203.0.113.7:50000")
+			require.NoError(t, tc.reg.BindClient(ctx, client, "2c69:QXyz", time.Minute))
+			require.NoError(t, tc.reg.DeleteClient(ctx, client))
+			_, ok, err := tc.reg.LookupClient(ctx, client)
+			require.NoError(t, err)
+			assert.False(t, ok)
+			require.NoError(t, tc.reg.DeleteClient(ctx, client), "deleting a missing key is not an error")
+		})
+	}
+}
+
+func TestNewRedisRegistryRefusesAClientWithoutContextTimeouts(t *testing.T) {
+	rc := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	defer rc.Close()
+	_, err := NewRedisRegistry(rc)
+	assert.Error(t, err)
+}
+
 func TestRedisRegistryKeys(t *testing.T) {
 	mr := miniredis.RunT(t)
-	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rc.Close()
-	reg := NewRedisRegistry(rc)
+	reg := newTestRedisRegistry(t, mr.Addr())
 	require.NoError(t, reg.PutSession(t.Context(), "2c69:QXyz", testSession, time.Minute))
 	require.NoError(t, reg.BindClient(t.Context(), netip.MustParseAddrPort("203.0.113.7:50000"), "2c69:QXyz", time.Minute))
 	assert.True(t, mr.Exists("nn:sess:2c69:QXyz"))
 	assert.Equal(t, time.Minute, mr.TTL("nn:sess:2c69:QXyz"))
+	sess, err := mr.Get("nn:sess:2c69:QXyz")
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"serverId":"srv-1","target":"10.0.0.3:19140","icePwd":"`+testPwd+`"}`, sess)
 	got, err := mr.Get("nn:client:203.0.113.7:50000")
 	require.NoError(t, err)
 	assert.Equal(t, "2c69:QXyz", got)

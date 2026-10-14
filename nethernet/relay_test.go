@@ -10,7 +10,6 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -199,9 +198,7 @@ func TestRelayIgnoresADTLSAlertFromTheClientSide(t *testing.T) {
 
 func sharedRedis(t *testing.T) (*miniredis.Miniredis, Registry) {
 	mr := miniredis.RunT(t)
-	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = rc.Close() })
-	return mr, NewRedisRegistry(rc)
+	return mr, newTestRedisRegistry(t, mr.Addr())
 }
 
 func TestRelayRelaysASessionSignaledOnAnotherReplica(t *testing.T) {
