@@ -19,6 +19,7 @@ var wakeWho = Identity{XUID: "2535400000000001", Gamertag: "Synthetic Steve"}
 func TestAPIWakerSendsTheTokenPortAndPlayer(t *testing.T) {
 	var gotPath, gotToken, gotCT, gotInternalKey string
 	var gotBody map[string]any
+	var gotDecodeErr error // asserted after Wake: t.FailNow is unsafe in the handler goroutine
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -28,13 +29,14 @@ func TestAPIWakerSendsTheTokenPortAndPlayer(t *testing.T) {
 		gotToken = r.Header.Get("X-NetherNet-Router-Token")
 		gotInternalKey = r.Header.Get("X-Internal-API-Key")
 		gotCT = r.Header.Get("Content-Type")
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotBody))
+		gotDecodeErr = json.NewDecoder(r.Body).Decode(&gotBody)
 		_, _ = w.Write([]byte(`{"success":true,"woken":true,"booting":false,"message":"waking"}`))
 	}))
 	defer srv.Close()
 
 	res, err := NewAPIWaker(srv.URL+"/", "router-secret", srv.Client()).Wake(context.Background(), 30017, wakeWho)
 	require.NoError(t, err)
+	require.NoError(t, gotDecodeErr)
 	assert.Equal(t, WakeResult{Woken: true, Message: "waking"}, res)
 	assert.Equal(t, "/v1/internal/servers/bedrock/nethernet-wake", gotPath)
 	assert.Equal(t, "router-secret", gotToken)
