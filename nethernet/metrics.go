@@ -6,7 +6,7 @@ import "github.com/prometheus/client_golang/prometheus"
 // NewMetrics, never on the default registry the Java mc-router metrics use.
 // A nil *Metrics is valid and records nothing.
 type Metrics struct {
-	SignalingRequests *prometheus.CounterVec // result
+	SignalingRequests *prometheus.CounterVec // transport (tls, http; "" when refused before a byte is read), result
 	TLSHandshakes     *prometheus.CounterVec // outcome
 	WakeHolds         *prometheus.CounterVec // outcome
 	Sessions          *prometheus.GaugeVec   // server, state (signaled, bound)
@@ -19,8 +19,8 @@ type Metrics struct {
 func NewMetrics(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
 		SignalingRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "nethernet_signaling_requests_total", Help: "NetherNet signaling requests by result.",
-		}, []string{"result"}),
+			Name: "nethernet_signaling_requests_total", Help: "NetherNet signaling requests by transport (tls, http) and result.",
+		}, []string{"transport", "result"}),
 		TLSHandshakes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "nethernet_tls_handshakes_total", Help: "TLS handshakes on the signaling port by outcome.",
 		}, []string{"outcome"}),
@@ -79,9 +79,9 @@ func (m *Metrics) lookupDropped(kind string) {
 	}
 }
 
-func (m *Metrics) signal(result string) {
+func (m *Metrics) signal(transport, result string) {
 	if m != nil {
-		m.SignalingRequests.WithLabelValues(result).Inc()
+		m.SignalingRequests.WithLabelValues(transport, result).Inc()
 	}
 }
 

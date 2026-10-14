@@ -115,7 +115,8 @@ type join struct {
 	localPort int
 	start     time.Time
 	src       netip.Addr
-	trusted   bool // src is the player's own address (Ruling R36)
+	trusted   bool   // src is the player's own address (Ruling R36)
+	transport string // "tls" or "http", the metric label (spec §6.9); "" until the first byte is read
 }
 
 // ServeConn handles one connection accepted on localPort and closes it: one
@@ -134,7 +135,7 @@ func (s *SignalServer) ServeConn(ctx context.Context, conn net.Conn, localPort i
 		limiter = s.legacy
 	}
 	if ok, scope, logIt, suppressed := limiter.allow(perIP, s.now()); !ok {
-		s.o.Metrics.signal("rate_limited")
+		s.o.Metrics.signal("", "rate_limited") // no byte read yet: the transport is unknown
 		if logIt {
 			fields := logrus.Fields{"scope": scope, "ip": perIP, "legacy": limiter == s.legacy}
 			if scope == "global" {
@@ -154,7 +155,9 @@ func (s *SignalServer) ServeConn(ctx context.Context, conn net.Conn, localPort i
 		io.Reader
 		io.Writer
 	}{br, j.conn}
+	j.transport = "http"
 	if first[0] == 0x16 {
+		j.transport = "tls"
 		tc, ok := s.terminateTLS(ctx, j.conn, br)
 		if !ok {
 			return
@@ -210,7 +213,7 @@ func (s *SignalServer) terminateTLS(ctx context.Context, conn net.Conn, br *bufi
 	cert := s.certFor(sni)
 	if cert == nil {
 		s.o.Metrics.tlsHandshake("refused_sni")
-		s.o.Metrics.signal("tls_refused")
+		s.o.Metrics.signal("tls", "tls_refused")
 		_, _ = conn.Write(tlsHandshakeFailure)
 		return nil, false
 	}
@@ -302,7 +305,7 @@ func (j *join) serve(ctx context.Context) {
 	s := j.s
 	req, err := http.ReadRequest(bufio.NewReader(io.LimitReader(j.rw, maxHeaderBytes+s.o.MaxBody)))
 	if err != nil {
-		s.o.Metrics.signal("bad_request")
+		s.o.Metrics.signal(j.transport, "bad_request")
 		return
 	}
 	if req.ContentLength > s.o.MaxBody {
@@ -311,7 +314,7 @@ func (j *join) serve(ctx context.Context) {
 	}
 	body, err := io.ReadAll(io.LimitReader(req.Body, s.o.MaxBody+1))
 	if err != nil {
-		s.o.Metrics.signal("bad_request")
+		s.o.Metrics.signal(j.transport, "bad_request")
 		return
 	}
 	if int64(len(body)) > s.o.MaxBody {
@@ -574,7 +577,7 @@ func (s *SignalServer) forward(ctx context.Context, b Backend, req *http.Request
 
 // reply writes one response and asks the client to close, as BDS does.
 func (j *join) reply(status int, h http.Header, body []byte, result string) {
-	j.s.o.Metrics.signal(result)
+	j.s.o.Metrics.signal(j.transport, result)
 	h = h.Clone()
 	if h == nil {
 		h = http.Header{}

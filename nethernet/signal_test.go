@@ -300,6 +300,8 @@ func TestSignalRoutesByHostAndRewrites(t *testing.T) {
 	assert.Equal(t, sigServer, rs.s.ServerID)
 	assert.Equal(t, "77jVAiq4D6YxKEPgZS2kvTfD", rs.s.IcePwd, "the server's ice-pwd signs the client's checks")
 	assert.Equal(t, 0, f.waker.count(), "an awake server is never woken")
+	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.SignalingRequests.WithLabelValues("http", "answered")),
+		"spec §6.9: a plain request is labelled http")
 }
 
 func TestSignalRoutesByLegacyPortWhenHostIsAnIP(t *testing.T) {
@@ -342,6 +344,7 @@ func TestSignalRefusesTLSForAForeignSNI(t *testing.T) {
 	assert.Empty(t, rest)
 	assert.Equal(t, []byte{0x15, 0x03, 0x01, 0x00, 0x02, 0x02, 0x28}, rec.got, "exactly BDS's fatal handshake_failure alert")
 	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.TLSHandshakes.WithLabelValues("refused_sni")))
+	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.SignalingRequests.WithLabelValues("tls", "tls_refused")))
 }
 
 // sigCert is a self-signed certificate for *.uniz.host and *.mc.uniz.host.
@@ -380,6 +383,8 @@ func TestSignalTerminatesTLSForOurDomain(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Contains(t, body, `"name":`)
 	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.TLSHandshakes.WithLabelValues("ok")))
+	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.SignalingRequests.WithLabelValues("tls", "asleep_card")),
+		"spec §6.9: a request served over TLS is labelled tls")
 }
 
 // Spec §6.3: never present a certificate whose name does not match. A name
@@ -1105,7 +1110,8 @@ func TestSignalRateLimitsPerIP(t *testing.T) {
 	}
 	assert.Nil(t, card("203.0.113.7"), "the 21st burst request from one IP is refused")
 	assert.NotNil(t, card("203.0.113.8"), "another IP still passes")
-	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.SignalingRequests.WithLabelValues("rate_limited")))
+	assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.SignalingRequests.WithLabelValues("", "rate_limited")),
+		"refused before a byte is read: the transport is not known")
 
 	t.Run("legacy listener: only the global tier", func(t *testing.T) {
 		f := newSigFixture(t)
@@ -1161,7 +1167,7 @@ func TestSignalALegacyFloodLeavesTheSignalPortAlone(t *testing.T) {
 		require.NoError(t, err)
 		_ = c.Close()
 	}
-	limited := f.metrics.SignalingRequests.WithLabelValues("rate_limited")
+	limited := f.metrics.SignalingRequests.WithLabelValues("", "rate_limited")
 	require.Eventually(t, func() bool { return testutil.ToFloat64(limited) == 10 }, 5*time.Second, 10*time.Millisecond,
 		"every flood connection was counted against a bucket")
 
