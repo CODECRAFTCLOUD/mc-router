@@ -107,14 +107,19 @@ type sigWaker struct {
 	ports     []int
 	deadlines []bool
 	result    func(n int) (WakeResult, error)
+	hang      bool // the API call runs until its context ends
 }
 
 func (w *sigWaker) Wake(ctx context.Context, legacyPort int, who Identity) (WakeResult, error) {
 	w.mu.Lock()
 	_, hasDeadline := ctx.Deadline()
 	w.calls, w.ports, w.deadlines = append(w.calls, who), append(w.ports, legacyPort), append(w.deadlines, hasDeadline)
-	n, f := len(w.calls), w.result
+	n, f, hang := len(w.calls), w.result, w.hang
 	w.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return WakeResult{}, fmt.Errorf("nethernet wake: %w", ctx.Err())
+	}
 	if f == nil {
 		return WakeResult{Woken: true}, nil
 	}
@@ -493,6 +498,35 @@ func TestSignalCountsAHangUpDuringTheHoldAsCancelled(t *testing.T) {
 	}, 3*time.Second, 20*time.Millisecond, "the hang-up ends the hold as cancelled")
 	assert.Equal(t, 1, f.waker.count(), "the wake was called before the hang-up")
 	assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")))
+}
+
+// A hang-up while the wake API call itself runs is cancelled, and the hold
+// running out during it is a timeout; neither is the API refusing.
+func TestSignalLabelsAWakeCallCutShortByWhyItEnded(t *testing.T) {
+	t.Run("the player hung up", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.opts.WakeHold = 5 * time.Second
+		f.asleep()
+		f.waker.hang = true
+		addr := f.serve(t, 19132)
+		sigDo(t, addr, sigReq{body: f.validOffer(t), closeAfter: 300 * time.Millisecond})
+		require.Eventually(t, func() bool {
+			return testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("cancelled")) == 1
+		}, 3*time.Second, 20*time.Millisecond)
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("refused")))
+	})
+	t.Run("the hold ran out", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.opts.WakeHold = 300 * time.Millisecond
+		f.asleep()
+		f.waker.hang = true
+		addr := f.serve(t, 19132)
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("timeout")))
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.WakeHolds.WithLabelValues("refused")))
+	})
 }
 
 func TestSignalHoldsWhenAlreadyBooting(t *testing.T) {

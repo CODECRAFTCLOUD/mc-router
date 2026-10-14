@@ -429,6 +429,12 @@ func (j *join) wake(ctx context.Context, req *http.Request, offer []byte, b Back
 			s.backoff.put(b.LegacyPort, cachedWake{at: s.now(), res: res})
 		}
 	}
+	if err != nil && ctx.Err() != nil { // the player hung up during the API call
+		return refuse(http.StatusServiceUnavailable, "cancelled")
+	}
+	if err != nil && hold.Err() != nil { // the hold ran out during the API call
+		return refuse(http.StatusServiceUnavailable, "timeout")
+	}
 	if err != nil || !res.Woken && !res.Booting {
 		logrus.WithError(err).WithFields(logrus.Fields{"serverId": b.ServerID, "message": res.Message, "cached": cached}).Info("nethernet: wake refused")
 		return refuse(http.StatusServiceUnavailable, "refused")
