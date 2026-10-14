@@ -45,7 +45,7 @@ type Config struct {
 	UdpPort                   int           `default:"19132" usage:"UDP port for the relay"`
 	LegacyPortMin             int           `default:"30000" usage:"First legacy pool port to listen on for signaling (host:port addresses)"`
 	LegacyPortMax             int           `default:"31000" usage:"Last legacy pool port to listen on for signaling"`
-	PublicIp                  string        `usage:"Required. The IP literal every SDP answer advertises (a hostname makes the client fail with Door)"`
+	PublicIp                  string        `usage:"Required. The IPv4 literal every SDP answer advertises (a hostname makes the client fail with Door)"`
 	TlsCert                   string        `usage:"Path to the TLS certificate (PEM); re-read when the file changes"`
 	TlsKey                    string        `usage:"Path to the TLS private key (PEM)"`
 	TlsDomains                []string      `default:"uniz.host,mc.uniz.host" usage:"TLS is served for an SNI under one of these that the certificate covers; any other SNI gets a handshake_failure alert"`
