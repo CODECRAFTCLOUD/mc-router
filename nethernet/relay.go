@@ -23,7 +23,8 @@ const (
 	// negative cache), and at most maxLookupKeys distinct keys per window.
 	lookupWindow  = time.Second
 	maxLookupKeys = 4096
-	// A longer STUN USERNAME is dropped (RFC 5389 section 15.3 keeps it under 513 bytes).
+	// A STUN USERNAME of maxUsername bytes or more is dropped: RFC 5389 section
+	// 15.3 allows fewer than 513 bytes.
 	maxUsername = 513
 )
 
@@ -207,7 +208,7 @@ func (r *Relay) bindFromSTUN(ctx context.Context, from netip.AddrPort, pkt []byt
 		r.opt.Metrics.dropped("unknown_peer")
 		return
 	}
-	if len(pair) > maxUsername { // never a lookup key: it would bloat the de-dup sets
+	if len(pair) >= maxUsername { // never a lookup key: it would bloat the de-dup sets
 		r.opt.Metrics.dropped("bad_username")
 		return
 	}

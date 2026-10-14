@@ -750,19 +750,33 @@ func bindingWithUsername(n int) []byte {
 }
 
 func TestRelayDropsAnOversizedUsernameWithoutALookup(t *testing.T) {
-	m := NewMetrics(prometheus.NewRegistry())
-	local, shared := &countingRegistry{Registry: NewMemoryRegistry()}, &countingRegistry{Registry: NewMemoryRegistry()}
-	_, relayAddr := startRelay(t, local, shared, defaultOpts(m))
-	pkt := bindingWithUsername(514)
-	u, ok := STUNUsername(pkt)
-	require.True(t, ok)
-	require.Len(t, u, 514)
+	// RFC 5389 section 15.3: a USERNAME is fewer than 513 bytes.
+	for _, tc := range []struct {
+		n       int
+		dropped bool
+	}{{512, false}, {513, true}} {
+		t.Run(fmt.Sprint(tc.n), func(t *testing.T) {
+			m := NewMetrics(prometheus.NewRegistry())
+			local, shared := &countingRegistry{Registry: NewMemoryRegistry()}, &countingRegistry{Registry: NewMemoryRegistry()}
+			_, relayAddr := startRelay(t, local, shared, defaultOpts(m))
+			pkt := bindingWithUsername(tc.n)
+			u, ok := STUNUsername(pkt)
+			require.True(t, ok)
+			require.Len(t, u, tc.n)
 
-	send(t, newClient(t), relayAddr, pkt)
-	assert.Eventually(t, func() bool { return testutil.ToFloat64(m.UDPDropped.WithLabelValues("bad_username")) == 1 },
-		time.Second, 10*time.Millisecond)
-	time.Sleep(100 * time.Millisecond)
-	assert.Equal(t, int32(0), local.gets.Load()+shared.gets.Load(), "an oversized USERNAME is never a lookup key")
+			send(t, newClient(t), relayAddr, pkt)
+			if tc.dropped {
+				assert.Eventually(t, func() bool { return testutil.ToFloat64(m.UDPDropped.WithLabelValues("bad_username")) == 1 },
+					time.Second, 10*time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
+				assert.Equal(t, int32(0), local.gets.Load()+shared.gets.Load(), "an oversized USERNAME is never a lookup key")
+				return
+			}
+			assert.Eventually(t, func() bool { return shared.gets.Load() == 1 }, time.Second, 10*time.Millisecond,
+				"a 512-byte USERNAME is looked up")
+			assert.Equal(t, 0.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("bad_username")))
+		})
+	}
 }
 
 func TestRelayCountsAFullQueueAsAQueueFullDrop(t *testing.T) {
