@@ -782,3 +782,34 @@ func TestRelayCountsAFullQueueAsAQueueFullDrop(t *testing.T) {
 	assert.Equal(t, 1.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("queue_full")))
 	assert.Equal(t, 0.0, testutil.ToFloat64(m.RegistryErrors), "a full queue is not a registry error")
 }
+
+// failingPutRegistry fails PutSession while fail is set.
+type failingPutRegistry struct {
+	Registry
+	fail atomic.Bool
+}
+
+func (f *failingPutRegistry) PutSession(ctx context.Context, pair string, s Session, ttl time.Duration) error {
+	if f.fail.Load() {
+		return fmt.Errorf("local registry down")
+	}
+	return f.Registry.PutSession(ctx, pair, s, ttl)
+}
+
+func TestRelayRegisterReleasesItsSlotsWhenTheLocalWriteFails(t *testing.T) {
+	bds := startBDS(t)
+	m := NewMetrics(prometheus.NewRegistry())
+	local := &failingPutRegistry{Registry: NewMemoryRegistry()}
+	opt := defaultOpts(m)
+	opt.MaxSessions, opt.MaxSessionsPerServer, opt.MaxPerIPPerServer = 1, 1, 1
+	r, _ := startRelay(t, local, nil, opt)
+
+	local.fail.Store(true)
+	require.Error(t, r.Register(t.Context(), testPair, trusted(bds, "srv-1", "198.51.100.7")))
+	assert.True(t, r.activeSession(testPair) == nil, "nothing is kept")
+	assert.Equal(t, 0.0, testutil.ToFloat64(m.Sessions.WithLabelValues("srv-1", "signaled")))
+
+	local.fail.Store(false)
+	assert.NoError(t, r.Register(t.Context(), "2c69:0002", trusted(bds, "srv-1", "198.51.100.7")),
+		"the global, per-server and per-IP slots were released")
+}

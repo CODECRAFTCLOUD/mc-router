@@ -112,6 +112,7 @@ func (r *Relay) Register(ctx context.Context, pair string, s Session) error {
 	if s.SignalIPTrusted && !s.SignalIP.IsValid() {
 		return ErrInvalidSignalIP
 	}
+	var added *relaySession
 	r.mu.Lock()
 	if rs := r.byPair[pair]; rs != nil {
 		s.CreatedAt = rs.s.CreatedAt
@@ -122,14 +123,19 @@ func (r *Relay) Register(ctx context.Context, pair string, s Session) error {
 			r.mu.Unlock()
 			return ErrSessionCap
 		}
-		rs := r.addLocked(pair, s)
+		added = r.addLocked(pair, s)
 		if s.SignalIPTrusted {
-			rs.ipKey, rs.countsForIP = key, true
+			added.ipKey, added.countsForIP = key, true
 			r.perIP[key]++
 		}
 	}
 	r.mu.Unlock()
 	if err := r.local.PutSession(ctx, pair, s, r.opt.UnboundTTL); err != nil {
+		r.mu.Lock()
+		if added != nil && r.byPair[pair] == added { // release every slot counted above
+			r.dropLocked(pair, added)
+		}
+		r.mu.Unlock()
 		return err
 	}
 	if r.shared != nil {
