@@ -1,0 +1,2 @@
+# Golden SDP captures: keep CRLF byte-for-byte.
+*.sdp -text
