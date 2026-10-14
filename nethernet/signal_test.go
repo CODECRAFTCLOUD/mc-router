@@ -159,7 +159,7 @@ func newSigFixture(t *testing.T) *sigFixture {
 		TLSDomains: []string{"uniz.host", "mc.uniz.host"}, SignalPort: 19132,
 		WakeHold: 2 * time.Second, ProbeTimeout: 300 * time.Millisecond, MaxBody: 1 << 20, RequestTimeout: 5 * time.Second,
 		WakesPerPlayer: 5, WakeWindow: time.Hour, WakeBackoff: 5 * time.Second,
-		PerIPRate: 5, GlobalRate: 200, Identity: f.ident.v, Metrics: f.metrics,
+		PerIPRate: 5, GlobalRate: 200, LegacyRate: 200, Identity: f.ident.v, Metrics: f.metrics,
 	}
 	f.awake()
 	return f
@@ -180,6 +180,13 @@ func (f *sigFixture) serve(t *testing.T, localPort int, tweak ...func(*SignalSer
 	for _, fn := range tweak {
 		fn(s)
 	}
+	return serveOn(t, s, localPort)
+}
+
+// serveOn runs s on a fresh loopback listener that stands for localPort, so
+// one server can listen on the signal port and a legacy port at once.
+func serveOn(t *testing.T, s *SignalServer, localPort int) string {
+	t.Helper()
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1114,6 +1121,19 @@ func TestSignalRateLimitsPerIP(t *testing.T) {
 		f := newSigFixture(t)
 		f.opts.GlobalRate = 2 // burst 4
 		f.asleep()
+		addr := f.serve(t, 19132, frozen)
+		passed := 0
+		for range 8 {
+			if resp, _ := sigDo(t, addr, sigReq{method: http.MethodGet}); resp != nil {
+				passed++
+			}
+		}
+		assert.Equal(t, 4, passed, "the global burst")
+	})
+	t.Run("the legacy tier", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.opts.LegacyRate = 2 // burst 4
+		f.asleep()
 		addr := f.serve(t, sigLegacy, frozen)
 		passed := 0
 		for range 8 {
@@ -1121,8 +1141,35 @@ func TestSignalRateLimitsPerIP(t *testing.T) {
 				passed++
 			}
 		}
-		assert.Equal(t, 4, passed, "the global burst")
+		assert.Equal(t, 4, passed, "the legacy burst")
 	})
+}
+
+// Review I-1 (probe A): the legacy listeners spend a bucket of their own, so a
+// flood from one source on a pool port never refuses a join on the signal port.
+func TestSignalALegacyFloodLeavesTheSignalPortAlone(t *testing.T) {
+	f := newSigFixture(t)
+	f.opts.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+	f.asleep()
+	s := NewSignalServer(f.opts)
+	at := time.Now()
+	s.now = func() time.Time { return at }
+	signal, legacy := serveOn(t, s, 19132), serveOn(t, s, sigLegacy)
+
+	for range 410 { // the legacy burst (400) and ten more, all empty
+		c, err := net.Dial("tcp4", legacy)
+		require.NoError(t, err)
+		_ = c.Close()
+	}
+	limited := f.metrics.SignalingRequests.WithLabelValues("rate_limited")
+	require.Eventually(t, func() bool { return testutil.ToFloat64(limited) == 10 }, 5*time.Second, 10*time.Millisecond,
+		"every flood connection was counted against a bucket")
+
+	resp, _ := sigDo(t, signal, sigReq{method: http.MethodGet, proxySrc: "198.51.100.9"})
+	require.NotNil(t, resp, "a fresh player on the signal port is not refused")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	resp, _ = sigDo(t, legacy, sigReq{method: http.MethodGet, host: "82.26.104.95:30042"})
+	assert.Nil(t, resp, "the legacy bucket itself stays bounded")
 }
 
 func TestSignalAnswers503AtTheSessionCap(t *testing.T) {

@@ -53,20 +53,23 @@ func TestConfigSignalingLimitsReachSignalOptions(t *testing.T) {
 	o := c.signalOptions()
 	assert.Equal(t, 5, o.PerIPRate)
 	assert.Equal(t, 200, o.GlobalRate)
+	assert.Equal(t, 200, o.LegacyRate, "the legacy bucket defaults to the global one's size")
 	assert.Equal(t, int64(1048576), o.MaxBody)
 	assert.Equal(t, 5*time.Second, o.RequestTimeout)
 
-	c, err = parseConfig(append(base, "--signal-rate-per-ip", "7", "--signal-rate-global", "300",
+	c, err = parseConfig(append(base, "--signal-rate-per-ip", "7", "--signal-rate-global", "300", "--signal-rate-legacy", "250",
 		"--max-body", "65536", "--request-timeout", "8s"))
 	require.NoError(t, err)
 	o = c.signalOptions()
 	assert.Equal(t, 7, o.PerIPRate)
 	assert.Equal(t, 300, o.GlobalRate)
+	assert.Equal(t, 250, o.LegacyRate)
 	assert.Equal(t, int64(65536), o.MaxBody)
 	assert.Equal(t, 8*time.Second, o.RequestTimeout)
 
 	t.Setenv("NETHERNET_SIGNAL_RATE_PER_IP", "9")
 	t.Setenv("NETHERNET_SIGNAL_RATE_GLOBAL", "400")
+	t.Setenv("NETHERNET_SIGNAL_RATE_LEGACY", "350")
 	t.Setenv("NETHERNET_MAX_BODY", "2048")
 	t.Setenv("NETHERNET_REQUEST_TIMEOUT", "3s")
 	c, err = parseConfig(base)
@@ -74,6 +77,7 @@ func TestConfigSignalingLimitsReachSignalOptions(t *testing.T) {
 	o = c.signalOptions()
 	assert.Equal(t, 9, o.PerIPRate)
 	assert.Equal(t, 400, o.GlobalRate)
+	assert.Equal(t, 350, o.LegacyRate)
 	assert.Equal(t, int64(2048), o.MaxBody)
 	assert.Equal(t, 3*time.Second, o.RequestTimeout)
 }
@@ -109,6 +113,7 @@ func TestConfigRejectsUnusableSignalingLimits(t *testing.T) {
 	base := []string{"--public-ip", "82.26.104.95", "--api-url", "http://api", "--api-token", "t"}
 	for _, bad := range [][]string{
 		{"--max-body", "0"}, {"--request-timeout", "0s"}, {"--signal-rate-per-ip", "-1"}, {"--signal-rate-global", "-1"},
+		{"--signal-rate-legacy", "-1"},
 		{"--wake-limit-per-player", "0"}, {"--wake-limit-window", "0s"}, {"--wake-backoff", "0s"},
 	} {
 		_, err := parseConfig(append(slices.Clone(base), bad...))

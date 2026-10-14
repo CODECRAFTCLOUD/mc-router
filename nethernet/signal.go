@@ -61,8 +61,11 @@ type SignalOptions struct {
 	MaxBody        int64
 	RequestTimeout time.Duration // PROXY header, TLS handshake and the whole request, from the accept
 	// PerIPRate (bursts to 4x) applies to a player's own address only; GlobalRate
-	// (bursts to 2x) to every connection. Per second; 0 disables a tier.
-	PerIPRate, GlobalRate int
+	// (bursts to 2x) to every connection on the signal port. LegacyRate (bursts
+	// to 2x) is the legacy listeners' own bucket, so a flood on a pool port never
+	// refuses a signal-port join (review I-1); they have no per-IP tier, their
+	// source being the relay. Per second; 0 disables a tier.
+	PerIPRate, GlobalRate, LegacyRate int
 	// Ruling R34: one verified player makes at most WakesPerPlayer wake calls
 	// per rolling WakeWindow on this replica. Every call counts except a clear
 	// not-woken answer and a dial failure (Rulings C-1, C-6); a lifted
@@ -82,7 +85,8 @@ type SignalOptions struct {
 type SignalServer struct {
 	o       SignalOptions
 	getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error) // nil: TLS is never served
-	limiter *connRateLimiter
+	limiter *connRateLimiter                                     // the signal port
+	legacy  *connRateLimiter                                     // every legacy listener
 	wakes   *wakeLimiter
 	backoff wakeBackoffCache
 	hc      *http.Client
@@ -90,7 +94,7 @@ type SignalServer struct {
 }
 
 func NewSignalServer(o SignalOptions) *SignalServer {
-	s := &SignalServer{o: o, limiter: newConnRateLimiter(o.GlobalRate, o.PerIPRate),
+	s := &SignalServer{o: o, limiter: newConnRateLimiter(o.GlobalRate, o.PerIPRate), legacy: newConnRateLimiter(o.LegacyRate, 0),
 		wakes: newWakeLimiter(o.WakesPerPlayer, o.WakeWindow), backoff: wakeBackoffCache{ttl: o.WakeBackoff, byPort: map[int]cachedWake{}}, now: time.Now}
 	s.getCert = o.GetCertificate
 	if s.getCert == nil && o.TLSCert != nil {
@@ -125,7 +129,11 @@ func (s *SignalServer) ServeConn(ctx context.Context, conn net.Conn, localPort i
 	if j.trusted {
 		perIP = j.src
 	}
-	if ok, scope, logIt := s.limiter.allow(perIP, s.now()); !ok {
+	limiter := s.limiter
+	if localPort != s.o.SignalPort {
+		limiter = s.legacy
+	}
+	if ok, scope, logIt := limiter.allow(perIP, s.now()); !ok {
 		s.o.Metrics.signal("rate_limited")
 		if logIt {
 			logrus.WithFields(logrus.Fields{"scope": scope, "ip": perIP}).Warn("nethernet: signaling rate limited")

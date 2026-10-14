@@ -946,7 +946,8 @@ Every flag can also be set by its `NETHERNET_<NAME>` environment variable (the p
 | `-idle-timeout` | `NETHERNET_IDLE_TIMEOUT` | `30s` | A bound session with no client datagram for this long is dropped. |
 | `-hard-reap` | `NETHERNET_HARD_REAP` | `0s` | Drop any session this old. `0` disables. |
 | `-signal-rate-per-ip` | `NETHERNET_SIGNAL_RATE_PER_IP` | `5` | Signaling connections per second per player IP (IPv6 /64), bursting to 4x. Applies to the player's own address only, never to a relay's. `0` disables. |
-| `-signal-rate-global` | `NETHERNET_SIGNAL_RATE_GLOBAL` | `200` | Signaling connections per second in all, bursting to 2x. `0` disables. |
+| `-signal-rate-global` | `NETHERNET_SIGNAL_RATE_GLOBAL` | `200` | Signaling connections per second in all on the signal port, bursting to 2x. `0` disables. |
+| `-signal-rate-legacy` | `NETHERNET_SIGNAL_RATE_LEGACY` | `200` | Signaling connections per second in all on the legacy pool ports, bursting to 2x. A bucket of their own, so a flood on a pool port never refuses a signal-port join; it can still refuse legacy joins. There is no per-IP tier there: every legacy connection arrives from the relay's address. `0` disables. |
 | `-max-body` | `NETHERNET_MAX_BODY` | `1048576` | Largest signaling request body, and largest backend answer, in bytes. |
 | `-request-timeout` | `NETHERNET_REQUEST_TIMEOUT` | `5s` | Time from the accept to a fully read signaling request: PROXY header, TLS handshake, headers and body. |
 | `-wake-limit-per-player` | `NETHERNET_WAKE_LIMIT_PER_PLAYER` | `5` | Wake calls one verified player may cause per `-wake-limit-window` on this replica. Every call counts except a clear not-woken answer (booting or refused) and a dial failure, which never reached the API. A timeout, a non-200 or a cut-short call counts, because the API may still have woken the server. |

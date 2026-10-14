@@ -65,7 +65,8 @@ type Config struct {
 	IdleTimeout               time.Duration `default:"30s" usage:"A bound session with no client datagram for this long is dropped"`
 	HardReap                  time.Duration `default:"0s" usage:"Drop any session this old; 0 disables"`
 	SignalRatePerIp           int           `default:"5" usage:"Signaling connections per second per player IP (IPv6 /64), bursting to 4x; the player's own address only, never a relay's; 0 disables"`
-	SignalRateGlobal          int           `default:"200" usage:"Signaling connections per second in all, bursting to 2x; 0 disables"`
+	SignalRateGlobal          int           `default:"200" usage:"Signaling connections per second in all on the signal port, bursting to 2x; 0 disables"`
+	SignalRateLegacy          int           `default:"200" usage:"Signaling connections per second in all on the legacy pool ports, bursting to 2x: a bucket of their own, so a flood on a pool port never refuses a signal-port join; 0 disables"`
 	MaxBody                   int64         `default:"1048576" usage:"Largest signaling request or backend answer body, in bytes"`
 	RequestTimeout            time.Duration `default:"5s" usage:"Time from accept to a fully read signaling request: PROXY header, TLS handshake, headers and body"`
 	WakeLimitPerPlayer        int           `default:"5" usage:"Wake calls one verified player may cause per --wake-limit-window on this replica. Every call counts except a clear not-woken answer (booting or refused) and a dial failure, which never reached the API"`
@@ -124,8 +125,8 @@ func (c *Config) validate() error {
 	if c.WakeLimitPerPlayer <= 0 || c.WakeLimitWindow <= 0 || c.WakeBackoff <= 0 {
 		return errors.New("--wake-limit-per-player, --wake-limit-window and --wake-backoff must be > 0")
 	}
-	if c.SignalRatePerIp < 0 || c.SignalRateGlobal < 0 {
-		return errors.New("--signal-rate-per-ip and --signal-rate-global must be >= 0 (0 disables)")
+	if c.SignalRatePerIp < 0 || c.SignalRateGlobal < 0 || c.SignalRateLegacy < 0 {
+		return errors.New("--signal-rate-per-ip, --signal-rate-global and --signal-rate-legacy must be >= 0 (0 disables)")
 	}
 	return nil
 }
@@ -314,7 +315,7 @@ func (c *Config) signalOptions() nethernet.SignalOptions {
 		PublicAddr: netip.AddrPortFrom(netip.MustParseAddr(c.PublicIp).Unmap(), uint16(c.UdpPort)),
 		TLSDomains: c.TlsDomains, SignalPort: c.SignalPort, TrustedProxies: trusted,
 		WakeHold: c.WakeHold, ProbeTimeout: c.ProbeTimeout, MaxBody: c.MaxBody, RequestTimeout: c.RequestTimeout,
-		PerIPRate: c.SignalRatePerIp, GlobalRate: c.SignalRateGlobal,
+		PerIPRate: c.SignalRatePerIp, GlobalRate: c.SignalRateGlobal, LegacyRate: c.SignalRateLegacy,
 		WakesPerPlayer: c.WakeLimitPerPlayer, WakeWindow: c.WakeLimitWindow, WakeBackoff: c.WakeBackoff,
 	}
 }
