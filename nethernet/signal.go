@@ -35,6 +35,9 @@ const (
 	// maxAnswerForwards bounds the forwards of one offer while BDS's answer has
 	// no candidate at the pod address (the first included).
 	maxAnswerForwards = 5
+	// minRetryForward is the least time a retry forward must have before the
+	// join's WakeHold ends; with less, the join stops retrying.
+	minRetryForward = time.Second
 )
 
 // tlsHandshakeFailure is the fatal handshake_failure alert BDS sends to a TLS
@@ -511,15 +514,27 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 	retry, cancel := context.WithDeadline(ctx, j.start.Add(s.o.WakeHold))
 	defer cancel()
 	var (
-		b      Backend
+		b      Backend // the Service that gave the last answer
 		resp   *http.Response
 		answer []byte
 		ans    SDPInfo
 		target netip.AddrPort
 	)
+	// exhausted ends a join whose last answer named no pod: the metric, the
+	// candidate IPs next to the pod IPs, and a 502.
+	exhausted := func(forwards int) {
+		if ctx.Err() == nil { // a hang-up is not a failed retry
+			s.o.Metrics.answerRetry("exhausted")
+		}
+		cands := make([]netip.Addr, 0, len(ans.Candidates)) // IPs only: no ports, no ufrag
+		for _, c := range ans.Candidates {
+			cands = append(cands, c.Addr.Addr())
+		}
+		fail(b, "no candidate at the pod address", fmt.Errorf("pods %v, answer candidates %v, forwards %d", b.PodIPs, cands, forwards))
+	}
 	for forwards := 1; ; forwards++ {
-		var ok bool
-		if b, ok = s.route(req.Host, j.localPort); !ok { // re-read each time: the route may have moved
+		cur, ok := s.route(req.Host, j.localPort) // re-read each time: the route may have moved
+		if !ok {
 			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
 			return
 		}
@@ -527,12 +542,17 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		if forwards > 1 {
 			fctx = retry
 		}
-		resp, answer, err = s.forward(fctx, b, req, offer)
+		resp, answer, err = s.forward(fctx, cur, req, offer)
 		if err != nil {
-			logrus.WithError(err).WithFields(logrus.Fields{"serverId": b.ServerID, "forwards": forwards}).Debug("nethernet: offer forward failed")
+			if forwards > 1 && ctx.Err() == nil && retry.Err() != nil { // the join's deadline cut a retry short
+				exhausted(forwards)
+				return
+			}
+			logrus.WithError(err).WithFields(logrus.Fields{"serverId": cur.ServerID, "forwards": forwards}).Debug("nethernet: offer forward failed")
 			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
 			return
 		}
+		b = cur
 		if resp.StatusCode < 200 || resp.StatusCode > 299 { // BDS's own refusal: its status, never its body
 			j.reply(resp.StatusCode, nil, nil, "backend_status")
 			return
@@ -560,14 +580,7 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 			break
 		}
 		if forwards == maxAnswerForwards || !s.waitToRetry(retry) {
-			if ctx.Err() == nil { // a hang-up is not a failed retry
-				s.o.Metrics.answerRetry("exhausted")
-			}
-			cands := make([]netip.Addr, 0, len(ans.Candidates)) // IPs only: no ports, no ufrag
-			for _, c := range ans.Candidates {
-				cands = append(cands, c.Addr.Addr())
-			}
-			fail(b, "no candidate at the pod address", fmt.Errorf("pods %v, answer candidates %v, forwards %d", b.PodIPs, cands, forwards))
+			exhausted(forwards)
 			return
 		}
 	}
@@ -591,9 +604,10 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 }
 
 // waitToRetry waits answerRetry before another forward, and reports false when
-// retry (the client, or the join's WakeHold) would end before that forward.
+// retry (the client, or the join's WakeHold) would end before that forward had
+// minRetryForward to answer in.
 func (s *SignalServer) waitToRetry(retry context.Context) bool {
-	if dl, ok := retry.Deadline(); ok && time.Until(dl) <= s.answerRetry {
+	if dl, ok := retry.Deadline(); ok && time.Until(dl) <= s.answerRetry+minRetryForward {
 		return false
 	}
 	t := time.NewTimer(s.answerRetry)

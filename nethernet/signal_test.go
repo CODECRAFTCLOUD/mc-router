@@ -30,6 +30,8 @@ import (
 	"github.com/pires/go-proxyproto"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1328,16 +1330,48 @@ func TestSignalGivesUpOnAnAnswerThatNeverNamesThePod(t *testing.T) {
 	})
 	t.Run("when the join's time runs out first", func(t *testing.T) {
 		f := newSigFixture(t)
-		f.opts.WakeHold = 500 * time.Millisecond
+		f.opts.WakeHold = 1750 * time.Millisecond
 		f.backend.setAnswer(func(n int32) string { return noPodAnswer(t, n) })
-		addr := f.serve(t, 19132, fastRetry(200*time.Millisecond))
+		addr := f.serve(t, 19132, fastRetry(300*time.Millisecond))
 		start := time.Now()
 		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
 		require.NotNil(t, resp)
 		assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
-		assert.Less(t, time.Since(start), 700*time.Millisecond, "no retry past WakeHold from the accept")
-		assert.Less(t, f.backend.posts.Load(), int32(5))
+		// A retry needs its 0.3 s wait plus 1 s of forward budget: after the forwards
+		// at about 0, 0.3 and 0.6 s, 1.75, 1.45 and 1.15 s are left, so the third ends it.
+		assert.Less(t, time.Since(start), 1100*time.Millisecond, "no retry without a forward's budget before WakeHold")
+		assert.Equal(t, int32(3), f.backend.posts.Load())
 		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
+	})
+	t.Run("when the deadline cuts a retry forward short", func(t *testing.T) {
+		hook := logrustest.NewGlobal()
+		t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{}) })
+		f := newSigFixture(t)
+		f.opts.WakeHold = 1500 * time.Millisecond
+		f.backend.setAnswer(func(n int32) string {
+			if n > 1 { // BDS answers the retry after the join's deadline
+				time.Sleep(2 * time.Second)
+			}
+			return noPodAnswer(t, n)
+		})
+		addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+		resp, body := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+		assert.NotContains(t, body, "a=candidate")
+		assert.Equal(t, int32(2), f.backend.posts.Load())
+		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("recovered")))
+		var logged []string
+		for _, e := range hook.AllEntries() {
+			if err, ok := e.Data[logrus.ErrorKey].(error); ok && e.Level == logrus.WarnLevel &&
+				strings.Contains(e.Message, "no candidate at the pod address") {
+				logged = append(logged, err.Error())
+			}
+		}
+		require.Len(t, logged, 1, "the final failure is logged")
+		assert.Contains(t, logged[0], "pods ["+sigPodIP+"]")
+		assert.Contains(t, logged[0], "10.0.0.77", "next to the answer's candidate IPs")
 	})
 }
 
