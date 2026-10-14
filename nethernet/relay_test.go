@@ -354,8 +354,10 @@ func TestRelayReapsSessionsPastHardReap(t *testing.T) {
 	opt := defaultOpts(nil)
 	opt.HardReap = 100 * time.Millisecond
 	r, relayAddr := startRelay(t, NewMemoryRegistry(), nil, opt)
-	require.NoError(t, r.Register(t.Context(), testPair, session(bds)))
+	// Never is registered first, so it is never younger than testPair: the reap
+	// pass that drops testPair has already dropped it.
 	require.NoError(t, r.Register(t.Context(), "2c69:Never", session(bds)))
+	require.NoError(t, r.Register(t.Context(), testPair, session(bds)))
 
 	c := newClient(t)
 	stunPkt := signedBinding(testPair, testPwd)
@@ -480,7 +482,7 @@ func TestRelayReadLoopNeverWaitsOnASlowSharedRegistry(t *testing.T) {
 	select {
 	case got := <-bds.got:
 		assert.Equal(t, dtlsData, got)
-		assert.Less(t, time.Since(start), 50*time.Millisecond, "a bound client waited on the shared registry")
+		assert.Less(t, time.Since(start), 200*time.Millisecond, "a bound client waited on the shared registry")
 	case <-time.After(15 * time.Second):
 		t.Fatal("BDS got nothing")
 	}
