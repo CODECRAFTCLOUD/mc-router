@@ -873,3 +873,28 @@ func TestRelayReapsAnAdoptedSessionFromItsFirstSignal(t *testing.T) {
 	assert.Nil(t, r.activeSession(testPair), "adopted session is hard-reaped from its first-signal age")
 	r.closeAll()
 }
+
+// A4-2: lastSeen and lastShared are offsets on the relay's own monotonic
+// epoch, never wall-clock nanos, so a wall-clock step on this replica can
+// neither idle-reap a live session nor keep a dead one. (A test cannot step the
+// process wall clock; it pins the representation the reaper compares.)
+func TestRelayStampsClientTrafficOnItsMonotonicEpoch(t *testing.T) {
+	bds := startBDS(t)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer conn.Close()
+	r, err := NewRelay(conn, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(nil))
+	require.NoError(t, err)
+	rs, reason := r.bind(netip.MustParseAddrPort("127.0.0.1:40000"), testPair, session(bds), true)
+	require.NotNil(t, rs, reason)
+	r.queuePublish(rs)
+	r.forward(rs, dtlsData)
+	bds.expect(t, dtlsData)
+
+	assert.Less(t, rs.lastSeen.Load(), int64(time.Minute), "lastSeen is an offset on the relay epoch, not wall nanos")
+	assert.Less(t, rs.lastShared.Load(), int64(time.Minute), "lastShared is an offset on the relay epoch, not wall nanos")
+	r.reap(time.Now())
+	assert.NotNil(t, r.activeSession(testPair), "a session that just sent is not idle")
+	r.reap(time.Now().Add(2 * time.Minute))
+	assert.Nil(t, r.activeSession(testPair), "an idle bound session is still reaped on the monotonic clock")
+}

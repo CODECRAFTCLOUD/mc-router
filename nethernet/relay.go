@@ -64,8 +64,8 @@ type relaySession struct {
 	ipKey       ipServer       // guarded by Relay.mu, with countsForIP
 	countsForIP bool           // counted in Relay.perIP
 	client      netip.AddrPort // guarded by Relay.mu
-	lastSeen    atomic.Int64   // unix nanos of the last client datagram
-	lastShared  atomic.Int64   // unix nanos of the last shared-registry refresh
+	lastSeen    atomic.Int64   // Relay.since() of the last client datagram
+	lastShared  atomic.Int64   // Relay.since() of the last shared-registry refresh; 0 = never
 
 	publishing, republish bool           // guarded by Relay.mu
 	published             netip.AddrPort // the address in nn:client; owned by the one publish in flight
@@ -78,6 +78,9 @@ type Relay struct {
 	conn          *net.UDPConn
 	local, shared Registry
 	opt           RelayOptions
+	// epoch anchors lastSeen and lastShared: offsets on the monotonic clock, so
+	// a wall-clock step never idle-reaps or keeps a session.
+	epoch time.Time
 
 	mu        sync.Mutex
 	byClient  map[netip.AddrPort]*relaySession
@@ -99,7 +102,7 @@ func NewRelay(conn *net.UDPConn, local Registry, shared Registry, opt RelayOptio
 	if opt.UnboundTTL <= 0 || opt.IdleTimeout <= 0 || opt.HardReap < 0 || opt.MaxSessions <= 0 || opt.MaxSessionsPerServer <= 0 || opt.MaxPerIPPerServer <= 0 {
 		return nil, errors.New("nethernet relay: UnboundTTL, IdleTimeout, MaxSessions, MaxSessionsPerServer and MaxPerIPPerServer must be > 0, HardReap >= 0")
 	}
-	return &Relay{conn: conn, local: local, shared: shared, opt: opt,
+	return &Relay{conn: conn, local: local, shared: shared, opt: opt, epoch: time.Now(),
 		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{}, perServer: map[string]int{},
 		perIP: map[ipServer]int{},
 		jobs:  make(chan func(context.Context), sharedQueue)}, nil
@@ -362,7 +365,7 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 		return nil, "dial_failed"
 	}
 	rs.upstream = up
-	rs.lastSeen.Store(time.Now().UnixNano())
+	rs.lastSeen.Store(r.since())
 	rs.client = client
 	r.byClient[client] = rs
 	r.opt.Metrics.session(s.ServerID, "signaled", -1)
@@ -379,7 +382,8 @@ func (r *Relay) roomLocked(server string) bool {
 // addLocked records a signaled session. Callers hold mu.
 func (r *Relay) addLocked(pair string, s Session) *relaySession {
 	now := time.Now()
-	// The wall-clock age is read once, here; after that a wall-clock step on this
+	// The wall-clock age is read once, here (and in bind's adoption check); after
+	// that, with lastSeen and lastShared on r.epoch, a wall-clock step on this
 	// replica never reaps or keeps a session.
 	rs := &relaySession{pair: pair, s: s, created: now.Add(-now.Sub(s.CreatedAt))}
 	r.byPair[pair] = rs
@@ -395,7 +399,7 @@ func (r *Relay) queuePublish(rs *relaySession) {
 	if r.shared == nil {
 		return
 	}
-	rs.lastShared.Store(time.Now().UnixNano())
+	rs.lastShared.Store(r.since())
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if rs.publishing {
@@ -445,9 +449,9 @@ func (r *Relay) sharedCall(ctx context.Context, op string, call func(context.Con
 }
 
 func (r *Relay) forward(rs *relaySession, pkt []byte) {
-	now := time.Now().UnixNano()
+	now := r.since()
 	rs.lastSeen.Store(now)
-	if now-rs.lastShared.Load() >= int64(r.opt.IdleTimeout/2) {
+	if last := rs.lastShared.Load(); last == 0 || now-last >= int64(r.opt.IdleTimeout/2) {
 		r.queuePublish(rs)
 	}
 	if _, err := rs.upstream.Write(pkt); err != nil {
@@ -504,7 +508,7 @@ func (r *Relay) reap(now time.Time) {
 		switch {
 		case r.opt.HardReap > 0 && age > r.opt.HardReap,
 			rs.upstream == nil && age > r.opt.UnboundTTL,
-			rs.upstream != nil && now.UnixNano()-rs.lastSeen.Load() > int64(r.opt.IdleTimeout):
+			rs.upstream != nil && int64(now.Sub(r.epoch))-rs.lastSeen.Load() > int64(r.opt.IdleTimeout):
 			r.dropLocked(pair, rs)
 		}
 	}
@@ -574,5 +578,9 @@ func (r *Relay) activeSession(pair string) *relaySession {
 	defer r.mu.Unlock()
 	return r.byPair[pair]
 }
+
+// since is the monotonic offset of now on r.epoch, in nanoseconds, never 0
+// (0 marks "never"; Windows' monotonic clock can read the epoch itself).
+func (r *Relay) since() int64 { return max(int64(time.Since(r.epoch)), 1) }
 
 func isClosed(err error) bool { return errors.Is(err, net.ErrClosed) }
