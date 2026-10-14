@@ -14,7 +14,6 @@ type Metrics struct {
 	RegistryErrors    prometheus.Counter
 	RegistryQueueFull prometheus.Counter
 	LookupsDropped    *prometheus.CounterVec // kind (s, c)
-	Renominations     *prometheus.CounterVec // outcome (sent, confirmed)
 	AnswerRetries     *prometheus.CounterVec // outcome (recovered, exhausted)
 }
 
@@ -46,16 +45,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "nethernet_registry_lookups_dropped_total",
 			Help: "Shared-registry lookups skipped because their budget or queue was full, by kind (s: session by STUN username, c: client by address); the client's retransmit retries.",
 		}, []string{"kind"}),
-		Renominations: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "nethernet_renominations_total",
-			Help: "Client checks of an adopted session forwarded with USE-CANDIDATE added (sent), and server success responses that ended a session's re-nomination (confirmed).",
-		}, []string{"outcome"}),
 		AnswerRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "nethernet_answer_retries_total",
 			Help: "Joins whose answer had no candidate at the pod address and whose offer was forwarded again, by how the re-forwards ended: an answer that named the pod and a registered session (recovered), or a 502 (exhausted).",
 		}, []string{"outcome"}),
 	}
-	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors, m.RegistryQueueFull, m.LookupsDropped, m.Renominations, m.AnswerRetries)
+	reg.MustRegister(m.SignalingRequests, m.TLSHandshakes, m.WakeHolds, m.Sessions, m.UDPDropped, m.RegistryErrors, m.RegistryQueueFull, m.LookupsDropped, m.AnswerRetries)
 	return m
 }
 
@@ -104,12 +99,6 @@ func (m *Metrics) tlsHandshake(outcome string) {
 func (m *Metrics) wakeHold(outcome string) {
 	if m != nil {
 		m.WakeHolds.WithLabelValues(outcome).Inc()
-	}
-}
-
-func (m *Metrics) renomination(outcome string) {
-	if m != nil {
-		m.Renominations.WithLabelValues(outcome).Inc()
 	}
 }
 

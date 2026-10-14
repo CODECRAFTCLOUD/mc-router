@@ -20,7 +20,6 @@ func TestNewMetricsRegistersOnTheGivenRegistry(t *testing.T) {
 	m.RegistryErrors.Inc()
 	m.RegistryQueueFull.Inc()
 	m.LookupsDropped.WithLabelValues("s").Inc()
-	m.Renominations.WithLabelValues("sent").Inc()
 	m.AnswerRetries.WithLabelValues("recovered").Inc()
 
 	families, err := reg.Gather()
@@ -33,7 +32,7 @@ func TestNewMetricsRegistersOnTheGivenRegistry(t *testing.T) {
 		"nethernet_signaling_requests_total", "nethernet_tls_handshakes_total", "nethernet_wake_holds_total",
 		"nethernet_sessions", "nethernet_udp_dropped_total", "nethernet_registry_errors_total",
 		"nethernet_registry_queue_full_total", "nethernet_registry_lookups_dropped_total",
-		"nethernet_renominations_total", "nethernet_answer_retries_total",
+		"nethernet_answer_retries_total",
 	}, names)
 	assert.Equal(t, 1.0, testutil.ToFloat64(m.UDPDropped.WithLabelValues("unknown_peer")))
 }
@@ -45,7 +44,6 @@ func TestNilMetricsIsANoOp(t *testing.T) {
 		m.registryError()
 		m.queueFull()
 		m.lookupDropped("s")
-		m.renomination("sent")
 		m.answerRetry("recovered")
 		m.session("srv-1", "bound", 1)
 	})

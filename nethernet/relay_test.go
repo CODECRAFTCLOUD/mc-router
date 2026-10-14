@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/pion/stun/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -32,10 +31,7 @@ type fakeBDS struct {
 }
 
 // startBDS echoes every datagram back to its sender and reports what it got.
-func startBDS(t *testing.T) *fakeBDS { return startBDSReplying(t, func(p []byte) []byte { return p }) }
-
-// startBDSReplying answers every datagram with reply(datagram) and reports what it got.
-func startBDSReplying(t *testing.T, reply func([]byte) []byte) *fakeBDS {
+func startBDS(t *testing.T) *fakeBDS {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
@@ -50,9 +46,8 @@ func startBDSReplying(t *testing.T, reply func([]byte) []byte) *fakeBDS {
 				}
 				continue
 			}
-			got := append([]byte(nil), buf[:n]...)
-			b.got <- got
-			_, _ = conn.WriteToUDPAddrPort(reply(got), from)
+			b.got <- append([]byte(nil), buf[:n]...)
+			_, _ = conn.WriteToUDPAddrPort(buf[:n], from)
 		}
 	}()
 	return b
@@ -1023,141 +1018,4 @@ func TestRelayReleasesAnAdoptedSessionWhoseDialFails(t *testing.T) {
 	assert.Nil(t, r.activeSession(testPair), "the adopted session is not kept")
 	assert.Equal(t, 0.0, testutil.ToFloat64(m.Sessions.WithLabelValues("srv-1", "signaled")))
 	assert.NoError(t, r.Register(t.Context(), "2c69:0002", s), "its replica slot is free again")
-}
-
-// controllingBinding is a check as the client, the ICE-controlling agent, sends it.
-func controllingBinding(pair, pwd string) []byte {
-	return stun.MustBuild(stun.TransactionID, stun.BindingRequest, stun.NewUsername(pair),
-		stun.RawAttribute{Type: stun.AttrICEControlling, Value: []byte{1, 2, 3, 4, 5, 6, 7, 8}},
-		stun.NewShortTermIntegrity(pwd), stun.Fingerprint).Raw
-}
-
-// startICEBDS answers a Binding Request with a signed Binding Success Response
-// for its transaction, as the server's ICE agent does, and echoes the rest.
-func startICEBDS(t *testing.T, pwd string) *fakeBDS {
-	return startBDSReplying(t, func(p []byte) []byte {
-		m := &stun.Message{Raw: append([]byte(nil), p...)}
-		if !IsSTUN(p) || m.Decode() != nil || m.Type != stun.BindingRequest {
-			return p
-		}
-		return stun.MustBuild(stun.NewTransactionIDSetter(m.TransactionID), stun.BindingSuccess,
-			stun.NewShortTermIntegrity(pwd), stun.Fingerprint).Raw
-	})
-}
-
-// sendUntilBDS sends pkt every 50 ms until BDS gets a datagram, and returns it
-// decoded; a replica adopting a session drops the checks before its lookup ends.
-func sendUntilBDS(t *testing.T, c *net.UDPConn, to netip.AddrPort, pkt []byte, bds *fakeBDS) *stun.Message {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		require.True(t, time.Now().Before(deadline), "BDS never got the check")
-		send(t, c, to, pkt)
-		select {
-		case got := <-bds.got:
-			m := &stun.Message{Raw: got}
-			require.NoError(t, m.Decode())
-			time.Sleep(100 * time.Millisecond)
-			for len(bds.got) > 0 { // a late resend
-				<-bds.got
-			}
-			return m
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-}
-
-func assertNominates(t *testing.T, m *stun.Message, pwd string) {
-	t.Helper()
-	assert.True(t, m.Contains(stun.AttrUseCandidate), "the check carries USE-CANDIDATE")
-	assert.NoError(t, stun.NewShortTermIntegrity(pwd).Check(m), "BDS sees a valid MESSAGE-INTEGRITY")
-	assert.NoError(t, stun.Fingerprint.Check(m))
-}
-
-// Gate 1: the client of a session signaled on another replica binds here; its
-// check reaches the server from this replica's address and must nominate it.
-func TestRelayNominatesTheFirstCheckOfAnAdoptedSession(t *testing.T) {
-	bds := startBDS(t)
-	_, shared := sharedRedis(t)
-	m := NewMetrics(prometheus.NewRegistry())
-	a, _ := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
-	_, bAddr := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(m))
-	require.NoError(t, a.Register(t.Context(), testPair, session(bds)))
-
-	got := sendUntilBDS(t, newClient(t), bAddr, controllingBinding(testPair, testPwd), bds)
-	assertNominates(t, got, testPwd)
-	assert.GreaterOrEqual(t, testutil.ToFloat64(m.Renominations.WithLabelValues("sent")), 1.0)
-}
-
-// Gate 1's real path: the replica the client bound on goes away, and the
-// client's next datagram (DTLS) lands on another one, which adopts the session
-// by its client address. The client's next check nominates the new path.
-func TestRelayNominatesTheNextCheckAfterAFailover(t *testing.T) {
-	bds := startBDS(t)
-	mr, shared := sharedRedis(t)
-	a, aAddr := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
-	_, bAddr := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
-	require.NoError(t, a.Register(t.Context(), testPair, session(bds)))
-
-	c := newClient(t)
-	first := controllingBinding(testPair, testPwd)
-	send(t, c, aAddr, first)
-	bds.expect(t, first) // bound on the replica that signaled it: never rewritten
-	expectReply(t, c, aAddr, first)
-	assert.Eventually(t, func() bool { return mr.Exists("nn:client:" + clientAddr(c).String()) },
-		2*time.Second, 10*time.Millisecond, "bind on A reaches the shared registry")
-
-	retransmit(t, c, bAddr, dtlsData, bds)
-	check := controllingBinding(testPair, testPwd)
-	send(t, c, bAddr, check)
-	select {
-	case raw := <-bds.got:
-		m := &stun.Message{Raw: raw}
-		require.NoError(t, m.Decode())
-		assertNominates(t, m, testPwd)
-	case <-time.After(2 * time.Second):
-		t.Fatal("BDS got nothing")
-	}
-}
-
-// The server's success response for a rewritten transaction ends the
-// re-nomination: the next check is forwarded as the client sent it.
-func TestRelayStopsNominatingOnceTheServerConfirms(t *testing.T) {
-	bds := startICEBDS(t, testPwd)
-	_, shared := sharedRedis(t)
-	m := NewMetrics(prometheus.NewRegistry())
-	a, _ := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(nil))
-	b, bAddr := startRelay(t, NewMemoryRegistry(), shared, defaultOpts(m))
-	require.NoError(t, a.Register(t.Context(), testPair, session(bds)))
-
-	c := newClient(t)
-	got := sendUntilBDS(t, c, bAddr, controllingBinding(testPair, testPwd), bds)
-	assertNominates(t, got, testPwd)
-	assert.Eventually(t, func() bool { return !b.activeSession(testPair).renominate.Load() },
-		2*time.Second, 10*time.Millisecond, "the success response clears the flag")
-	assert.Equal(t, 1.0, testutil.ToFloat64(m.Renominations.WithLabelValues("confirmed")))
-
-	next := controllingBinding(testPair, testPwd)
-	send(t, c, bAddr, next)
-	bds.expect(t, next)
-}
-
-func TestRelayNeverNominatesASessionBoundWhereItWasSignaled(t *testing.T) {
-	bds := startBDS(t)
-	m := NewMetrics(prometheus.NewRegistry())
-	r, relayAddr := startRelay(t, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(m))
-	require.NoError(t, r.Register(t.Context(), testPair, session(bds)))
-
-	c := newClient(t)
-	for range 2 {
-		check := controllingBinding(testPair, testPwd)
-		send(t, c, relayAddr, check)
-		bds.expect(t, check)
-	}
-	moved := newClient(t) // a rebind keeps the upstream socket: the server's view is unchanged
-	check := controllingBinding(testPair, testPwd)
-	send(t, moved, relayAddr, check)
-	bds.expect(t, check)
-	assert.False(t, r.activeSession(testPair).renominate.Load())
-	assert.Equal(t, 0.0, testutil.ToFloat64(m.Renominations.WithLabelValues("sent")))
 }
