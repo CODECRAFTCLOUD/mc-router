@@ -60,6 +60,7 @@ type sigBackend struct {
 	offer  string
 	uri    string // the request-target as received, still escaped
 	answer func(n int32) string
+	status func(n int32) int // when set, the POST status for answer n
 }
 
 func startSigBackend(t *testing.T) *sigBackend {
@@ -69,7 +70,7 @@ func startSigBackend(t *testing.T) *sigBackend {
 		body, _ := io.ReadAll(r.Body)
 		b.mu.Lock()
 		b.host, b.offer, b.uri = r.Host, string(body), r.RequestURI
-		answer := b.answer
+		answer, status := b.answer, b.status
 		b.mu.Unlock()
 		if r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
@@ -79,7 +80,12 @@ func startSigBackend(t *testing.T) *sigBackend {
 		b.posts.Add(1)
 		w.Header().Set("Content-Type", "application/sdp")
 		if answer != nil {
-			_, _ = w.Write([]byte(answer(b.n.Add(1))))
+			n := b.n.Add(1)
+			body := answer(n)
+			if status != nil {
+				w.WriteHeader(status(n))
+			}
+			_, _ = w.Write([]byte(body))
 			return
 		}
 		_, _ = w.Write([]byte(readGolden(t, "answer-bds-1.26.52.3.sdp")))
@@ -90,6 +96,8 @@ func startSigBackend(t *testing.T) *sigBackend {
 }
 
 func (b *sigBackend) setAnswer(f func(n int32) string) { b.mu.Lock(); b.answer = f; b.mu.Unlock() }
+
+func (b *sigBackend) setStatus(f func(n int32) int) { b.mu.Lock(); b.status = f; b.mu.Unlock() }
 
 func (b *sigBackend) last() (host, offer string) {
 	b.mu.Lock()
@@ -1420,6 +1428,60 @@ func TestSignalGivesUpOnAnAnswerThatNeverNamesThePod(t *testing.T) {
 		assert.Equal(t, int32(1), f.backend.posts.Load(), "a failed first forward is never retried")
 		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
 	})
+	t.Run("not when the first forward is refused", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.backend.setAnswer(func(int32) string { return "" })
+		f.backend.setStatus(func(int32) int { return http.StatusConflict })
+		addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusConflict, resp.StatusCode, "BDS's own refusal of a first forward passes through")
+		assert.Equal(t, int32(1), f.backend.posts.Load())
+		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.SignalingRequests.WithLabelValues("http", "backend_status")))
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
+	})
+	// BDS may refuse the re-forwarded offer as a duplicate: that refusal is the
+	// retry's outcome, never passed through as BDS's own status.
+	for _, c := range []struct {
+		name   string
+		status int
+		answer string
+		cause  string
+	}{
+		{"when a retry is refused with 409", http.StatusConflict, "", "status 409"},
+		{"when a retry is refused with 500", http.StatusInternalServerError, "", "status 500"},
+		{"when a retry's 2xx answer does not parse", http.StatusOK, "v=0\r\ngarbage\r\n", "unparseable answer"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			hook := logrustest.NewGlobal()
+			t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{}) })
+			f := newSigFixture(t)
+			f.backend.setAnswer(func(n int32) string {
+				if n > 1 {
+					return c.answer
+				}
+				return noPodAnswer(t, n)
+			})
+			f.backend.setStatus(func(n int32) int {
+				if n > 1 {
+					return c.status
+				}
+				return http.StatusOK
+			})
+			addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+			resp, body := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+			require.NotNil(t, resp)
+			assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+			assert.NotContains(t, body, "a=candidate")
+			assert.Equal(t, int32(2), f.backend.posts.Load())
+			assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
+			logged := noPodWarns(hook)
+			require.Len(t, logged, 1, "the final failure is logged")
+			assert.Contains(t, logged[0], "pods ["+sigPodIP+"]")
+			assert.Contains(t, logged[0], "10.0.0.77", "next to the last no-pod answer's candidate IPs")
+			assert.Contains(t, logged[0], c.cause)
+		})
+	}
 	t.Run("with no time left for a retry", func(t *testing.T) {
 		f := newSigFixture(t)
 		f.opts.WakeHold = 10 * time.Millisecond
@@ -1480,4 +1542,16 @@ func TestSignalStopsRetryingWhenTheClientHangsUp(t *testing.T) {
 	assert.Equal(t, int32(1), posts, "the hang-up ends the wait before the next forward")
 	assert.Equal(t, posts, f.backend.posts.Load(), "no forward after the hang-up")
 	assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")), "a hang-up is not a failed retry")
+}
+
+// noPodWarns returns the errors of the Warn lines that end a join on a no-pod answer.
+func noPodWarns(hook *logrustest.Hook) []string {
+	var logged []string
+	for _, e := range hook.AllEntries() {
+		if err, ok := e.Data[logrus.ErrorKey].(error); ok && e.Level == logrus.WarnLevel &&
+			strings.Contains(e.Message, "no candidate at the pod address") {
+			logged = append(logged, err.Error())
+		}
+	}
+	return logged
 }

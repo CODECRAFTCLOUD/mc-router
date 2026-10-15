@@ -540,18 +540,23 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		ans      SDPInfo
 		target   netip.AddrPort
 		forwards int
+		// the last answer that named no pod, and the Service that gave it
+		noPodB   Backend
+		noPodAns SDPInfo
 	)
-	// exhausted ends a join whose last answer named no pod: the metric, the
-	// candidate IPs next to the pod IPs, and a 502.
-	exhausted := func() {
+	// exhausted ends a join on its last no-pod answer, whatever ended the
+	// retries (last): the metric, that answer's candidate IPs next to its
+	// Service's pod IPs, and a 502.
+	exhausted := func(last string) {
 		if forwards > 1 && ctx.Err() == nil { // only a re-forwarded join is a retry outcome, and a hang-up is none
 			s.o.Metrics.answerRetry("exhausted")
 		}
-		cands := make([]netip.Addr, 0, len(ans.Candidates)) // IPs only: no ports, no ufrag
-		for _, c := range ans.Candidates {
+		cands := make([]netip.Addr, 0, len(noPodAns.Candidates)) // IPs only: no ports, no ufrag
+		for _, c := range noPodAns.Candidates {
 			cands = append(cands, c.Addr.Addr())
 		}
-		fail(b, "no candidate at the pod address", fmt.Errorf("pods %v, answer candidates %v, forwards %d", b.PodIPs, cands, forwards))
+		fail(noPodB, "no candidate at the pod address",
+			fmt.Errorf("pods %v, answer candidates %v, forwards %d, last %s", noPodB.PodIPs, cands, forwards, last))
 	}
 	for forwards = 1; ; forwards++ {
 		cur, ok := s.route(req.Host, j.localPort) // re-read each time: the route may have moved
@@ -569,7 +574,7 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 			// A retry that fails for any reason (the join's deadline, its own
 			// forwardTimeout, a dropped connection) ends on the last no-pod answer.
 			if forwards > 1 && ctx.Err() == nil {
-				exhausted()
+				exhausted("forward error")
 				return
 			}
 			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
@@ -577,13 +582,23 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		}
 		b = cur
 		if resp.StatusCode < 200 || resp.StatusCode > 299 { // BDS's own refusal: its status, never its body
+			if forwards > 1 { // a retry's refusal (of a duplicate offer, say) is the retry's outcome
+				exhausted(fmt.Sprintf("status %d", resp.StatusCode))
+				return
+			}
 			j.reply(resp.StatusCode, nil, nil, "backend_status")
 			return
 		}
-		if ans, err = ParseSDP(string(answer)); err != nil {
+		parsed, err := ParseSDP(string(answer)) // never into ans: exhausted reports the last no-pod answer
+		if err != nil {
+			if forwards > 1 {
+				exhausted("unparseable answer")
+				return
+			}
 			fail(b, "answer", err)
 			return
 		}
+		ans = parsed
 		// PodIPs as of the answer, but only of the Service that answered: a route
 		// that moved to another Service meanwhile must not lend it its pods.
 		if fresh, ok := s.route(req.Host, j.localPort); ok && fresh.Addr == b.Addr {
@@ -599,8 +614,9 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		if target.IsValid() {
 			break
 		}
+		noPodB, noPodAns = b, ans
 		if forwards == maxAnswerForwards || !s.waitToRetry(retry) {
-			exhausted()
+			exhausted("no pod")
 			return
 		}
 	}
