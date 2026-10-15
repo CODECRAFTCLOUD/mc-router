@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -16,6 +17,7 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -63,6 +65,21 @@ func joinID(path string) (string, bool) {
 		}
 	}
 	return id, true
+}
+
+// freshNetworkID returns a random NetworkID for a re-forwarded offer: a decimal
+// uint64 in [1, 2^63). BDS keys a join attempt by NetworkID, and when the first,
+// unanswered attempt times out it closes the connection by that ID, the live one
+// (prod, 2026-10-15). BDS 1.26.52 accepts digits only (a GUID is a 400), and the
+// offer's a=identity signs only the fingerprint, not the ID.
+func freshNetworkID() string {
+	var b [8]byte
+	for {
+		_, _ = rand.Read(b[:]) // never fails: crypto/rand crashes the program instead
+		if n := binary.BigEndian.Uint64(b[:]) >> 1; n != 0 {
+			return strconv.FormatUint(n, 10)
+		}
+	}
 }
 
 // SignalOptions configure the NetherNet signaling server (spec §6.3-§6.7).
@@ -405,7 +422,7 @@ func (s *SignalServer) ready(ctx context.Context, b Backend) bool {
 // asleep card itself. It never wakes anything.
 func (j *join) card(ctx context.Context, req *http.Request, b Backend) {
 	if j.s.ready(ctx, b) {
-		resp, body, err := j.s.forward(ctx, b, req, nil)
+		resp, body, err := j.s.forward(ctx, b, req, "", nil)
 		if err != nil {
 			logrus.WithError(err).WithField("serverId", b.ServerID).Debug("nethernet: card forward failed")
 			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
@@ -515,10 +532,11 @@ func (j *join) wake(ctx context.Context, req *http.Request, offer []byte, b Back
 //
 // A BDS that has just started opens its signaling port before its NetherNet
 // transport can name its own pod address, so an answer without a candidate at
-// the pod is retried: the same offer is forwarded again answerRetry later, at
+// the pod is retried: the same offer is forwarded again answerRetry later, under
+// a fresh NetworkID (BDS would close the live connection by a reused one), at
 // most maxAnswerForwards times in all, and only while the join is within
-// WakeHold of the accept and the client is still there. BDS treats each
-// forward as a new attempt and abandons the unanswered one.
+// WakeHold of the accept and the client is still there. BDS keeps every
+// attempt; the abandoned ones time out under IDs the live connection does not use.
 func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 	s := j.s
 	fail := func(b Backend, why string, err error) {
@@ -571,11 +589,11 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
 			return
 		}
-		fctx := ctx // the first forward keeps its own timeout, as before retries existed
+		fctx, id := ctx, "" // the first forward keeps its own timeout and the client's NetworkID
 		if forwards > 1 {
-			fctx = retry
+			fctx, id = retry, freshNetworkID() // never the first attempt's ID: see freshNetworkID
 		}
-		resp, answer, err = s.forward(fctx, cur, req, offer)
+		resp, answer, err = s.forward(fctx, cur, req, id, offer)
 		if err != nil {
 			logrus.WithError(err).WithFields(logrus.Fields{"serverId": cur.ServerID, "forwards": forwards}).Debug("nethernet: offer forward failed")
 			// A retry that fails for any reason (the join's deadline, its own
@@ -667,14 +685,18 @@ func (s *SignalServer) waitToRetry(retry context.Context) bool {
 }
 
 // forward sends the request to the backend's signaling port as plain HTTP
-// with the original Host, and reads the response (at most MaxBody).
-func (s *SignalServer) forward(ctx context.Context, b Backend, req *http.Request, body []byte) (*http.Response, []byte, error) {
+// with the original Host, and reads the response (at most MaxBody). id, when
+// set, replaces the client's NetworkID in a join's path.
+func (s *SignalServer) forward(ctx context.Context, b Backend, req *http.Request, id string, body []byte) (*http.Response, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, forwardTimeout)
 	defer cancel()
 	// GET /v1/join as is; a join's ID re-escaped, so BDS gets one segment
 	// that decodes to the same ID, whatever escaping the client used.
 	uri := req.URL.Path
-	if id, ok := joinID(req.URL.Path); ok {
+	if cid, ok := joinID(req.URL.Path); ok {
+		if id == "" {
+			id = cid
+		}
 		uri = "/v1/join/" + url.PathEscape(id)
 	}
 	if req.URL.RawQuery != "" {

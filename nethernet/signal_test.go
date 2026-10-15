@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1303,10 +1304,13 @@ func fastRetry(d time.Duration) func(*SignalServer) {
 func TestSignalRetriesTheOfferUntilTheAnswerNamesThePod(t *testing.T) {
 	f := newSigFixture(t)
 	golden := readGolden(t, "answer-bds-1.26.52.3.sdp")
-	var offers []string
+	var offers, uris []string
 	f.backend.setAnswer(func(n int32) string {
 		_, got := f.backend.last()
 		offers = append(offers, got)
+		f.backend.mu.Lock()
+		uris = append(uris, f.backend.uri)
+		f.backend.mu.Unlock()
 		if n <= 2 {
 			return noPodAnswer(t, n)
 		}
@@ -1323,6 +1327,19 @@ func TestSignalRetriesTheOfferUntilTheAnswerNamesThePod(t *testing.T) {
 	require.Len(t, offers, 3)
 	for i, o := range offers {
 		assert.True(t, o == offer, "forward %d carries the same offer", i+1)
+	}
+	// BDS keys an attempt by NetworkID and, when the unanswered first attempt times
+	// out, closes the live connection by that ID (prod, 2026-10-15): every
+	// re-forward goes to a fresh decimal ID.
+	require.Len(t, uris, 3)
+	assert.Equal(t, sigPostURI, uris[0], "the first forward keeps the client's ID")
+	seen := map[string]bool{"1234567890": true}
+	for i, u := range uris[1:] {
+		id, ok := strings.CutPrefix(u, "/v1/join/")
+		require.True(t, ok, u)
+		assert.Regexp(t, `^[1-9][0-9]*$`, id, "forward %d", i+2)
+		assert.False(t, seen[id], "forward %d has an ID of its own", i+2)
+		seen[id] = true
 	}
 	assert.Nil(t, f.relay.activeSession("0001:QXyz"))
 	assert.Nil(t, f.relay.activeSession("0002:QXyz"))
@@ -1588,4 +1605,18 @@ func TestWaitToRetryNeedsTheWaitAndAForwardsBudget(t *testing.T) {
 	gone, hangUp := context.WithCancel(context.Background())
 	hangUp()
 	assert.False(t, s.waitToRetry(gone), "a hang-up ends the wait")
+}
+
+func TestFreshNetworkIDIsAPositiveDecimalUint63(t *testing.T) {
+	seen := map[string]bool{}
+	for range 1000 {
+		id := freshNetworkID()
+		require.Regexp(t, `^[1-9][0-9]*$`, id, "digits only, never 0, no leading zero")
+		require.LessOrEqual(t, len(id), 20)
+		n, err := strconv.ParseUint(id, 10, 64)
+		require.NoError(t, err)
+		require.Less(t, n, uint64(1)<<63)
+		seen[id] = true
+	}
+	assert.Greater(t, len(seen), 990, "random, not a counter or a constant")
 }

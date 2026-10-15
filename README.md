@@ -1002,7 +1002,7 @@ Every flag can also be set by its `NETHERNET_<NAME>` environment variable (the p
 - `nethernet_registry_lookups_dropped_total{kind}` (counter): shared-registry lookups skipped because their budget or queue was full; the client's retransmit retries.
   - `s`: a session by STUN username.
   - `c`: a client by address.
-- `nethernet_answer_retries_total{outcome}` (counter): joins whose answer had no candidate at the pod address and whose offer was forwarded again.
+- `nethernet_answer_retries_total{outcome}` (counter): joins whose answer had no candidate at the pod address and whose offer was forwarded again, each time under a fresh random NetworkID (BDS closes a connection by the ID of an attempt that times out).
   - `recovered`: a later answer named the pod and its session was registered.
   - `exhausted`: the join ended in a 502: the forwards ran out, the join's time ran out, or a retry forward failed, was refused (non-2xx) or got an answer that does not parse. A client that hung up is never counted.
 
