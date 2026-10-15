@@ -1351,17 +1351,20 @@ func TestSignalGivesUpOnAnAnswerThatNeverNamesThePod(t *testing.T) {
 	})
 	t.Run("when the join's time runs out first", func(t *testing.T) {
 		f := newSigFixture(t)
-		f.opts.WakeHold = 1750 * time.Millisecond
-		f.backend.setAnswer(func(n int32) string { return noPodAnswer(t, n) })
-		addr := f.serve(t, 19132, fastRetry(300*time.Millisecond))
+		// WakeHold = 3R+M: after two waits at most R+M is left, so the third check
+		// ends the join at any latency, and the second has R of slack (review M-2).
+		// BDS answers in 80 ms, the latency that made a 1.75 s hold flaky.
+		const r = 300 * time.Millisecond
+		f.opts.WakeHold = 3*r + minRetryForward
+		f.backend.setAnswer(func(n int32) string { time.Sleep(80 * time.Millisecond); return noPodAnswer(t, n) })
+		addr := f.serve(t, 19132, fastRetry(r))
 		start := time.Now()
 		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
 		require.NotNil(t, resp)
 		assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
-		// A retry needs its 0.3 s wait plus 1 s of forward budget: after the forwards
-		// at about 0, 0.3 and 0.6 s, 1.75, 1.45 and 1.15 s are left, so the third ends it.
-		assert.Less(t, time.Since(start), 1100*time.Millisecond, "no retry without a forward's budget before WakeHold")
-		assert.Equal(t, int32(3), f.backend.posts.Load())
+		assert.Less(t, time.Since(start), f.opts.WakeHold, "no retry without a forward's budget before WakeHold")
+		posts := f.backend.posts.Load()
+		assert.True(t, posts == 2 || posts == 3, "posts %d: never a fourth forward", posts)
 		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
 	})
 	t.Run("when the deadline cuts a retry forward short", func(t *testing.T) {
@@ -1562,4 +1565,27 @@ func noPodWarns(hook *logrustest.Hook) []string {
 		}
 	}
 	return logged
+}
+
+// waitToRetry's budget rule, without a server: deterministic, because the time
+// left on a deadline only shrinks.
+func TestWaitToRetryNeedsTheWaitAndAForwardsBudget(t *testing.T) {
+	const r = 200 * time.Millisecond
+	s := &SignalServer{answerRetry: r}
+
+	short, cancelShort := context.WithDeadline(context.Background(), time.Now().Add(r+minRetryForward-100*time.Millisecond))
+	defer cancelShort()
+	start := time.Now()
+	assert.False(t, s.waitToRetry(short), "less than R+M left: no retry")
+	assert.Less(t, time.Since(start), r, "and no wait")
+
+	long, cancelLong := context.WithDeadline(context.Background(), time.Now().Add(r+minRetryForward+2*time.Second))
+	defer cancelLong()
+	start = time.Now()
+	assert.True(t, s.waitToRetry(long), "R+M and more left: retry")
+	assert.GreaterOrEqual(t, time.Since(start), r, "after waiting R")
+
+	gone, hangUp := context.WithCancel(context.Background())
+	hangUp()
+	assert.False(t, s.waitToRetry(gone), "a hang-up ends the wait")
 }
