@@ -14,11 +14,12 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"regexp"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/pires/go-proxyproto"
 	"github.com/sirupsen/logrus"
@@ -44,7 +45,25 @@ const (
 // ClientHello, the one refusal clients were measured to fall back from.
 var tlsHandshakeFailure = []byte{0x15, 0x03, 0x01, 0x00, 0x02, 0x02, 0x28}
 
-var joinPostPath = regexp.MustCompile(`^/v1/join/[0-9]+$`)
+// maxNetworkID bounds the NetworkID in POST /v1/join/{id}, in bytes.
+const maxNetworkID = 128
+
+// joinID returns the NetworkID of a POST /v1/join/{id}, from the decoded path:
+// one non-empty path segment, otherwise opaque. Mojang's NetherNet guide (§9)
+// says its format may change (to a GUID, for one), so only what would make it
+// more than one segment, or unsafe in a URL or a log line, is refused.
+func joinID(path string) (string, bool) {
+	id, ok := strings.CutPrefix(path, "/v1/join/")
+	if !ok || id == "" || len(id) > maxNetworkID || id == "." || id == ".." || strings.Contains(id, "/") {
+		return "", false
+	}
+	for _, r := range id {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return "", false
+		}
+	}
+	return id, true
+}
 
 // SignalOptions configure the NetherNet signaling server (spec §6.3-§6.7).
 type SignalOptions struct {
@@ -331,7 +350,8 @@ func (j *join) serve(ctx context.Context) {
 		return
 	}
 	get := req.Method == http.MethodGet && req.URL.Path == "/v1/join"
-	if !get && (req.Method != http.MethodPost || !joinPostPath.MatchString(req.URL.Path)) {
+	_, post := joinID(req.URL.Path)
+	if !get && (req.Method != http.MethodPost || !post) {
 		j.reply(http.StatusNotFound, nil, nil, "not_found")
 		return
 	}
@@ -628,7 +648,16 @@ func (s *SignalServer) waitToRetry(retry context.Context) bool {
 func (s *SignalServer) forward(ctx context.Context, b Backend, req *http.Request, body []byte) (*http.Response, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, forwardTimeout)
 	defer cancel()
-	out, err := http.NewRequestWithContext(ctx, req.Method, "http://"+b.Addr.String()+req.URL.RequestURI(), bytes.NewReader(body))
+	// GET /v1/join as is; a join's ID re-escaped, so BDS gets one segment
+	// that decodes to the same ID, whatever escaping the client used.
+	uri := req.URL.Path
+	if id, ok := joinID(req.URL.Path); ok {
+		uri = "/v1/join/" + url.PathEscape(id)
+	}
+	if req.URL.RawQuery != "" {
+		uri += "?" + req.URL.RawQuery
+	}
+	out, err := http.NewRequestWithContext(ctx, req.Method, "http://"+b.Addr.String()+uri, bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, err
 	}

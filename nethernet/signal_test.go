@@ -58,6 +58,7 @@ type sigBackend struct {
 	mu     sync.Mutex
 	host   string
 	offer  string
+	uri    string // the request-target as received, still escaped
 	answer func(n int32) string
 }
 
@@ -67,7 +68,7 @@ func startSigBackend(t *testing.T) *sigBackend {
 	b.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		b.mu.Lock()
-		b.host, b.offer = r.Host, string(body)
+		b.host, b.offer, b.uri = r.Host, string(body), r.RequestURI
 		answer := b.answer
 		b.mu.Unlock()
 		if r.Method == http.MethodGet {
@@ -1075,7 +1076,6 @@ func TestSignal404sUnknownHostsAndPaths(t *testing.T) {
 		{host: "unknown.uniz.host:19132", body: "x"},
 		{method: http.MethodGet, uri: "/"},
 		{method: http.MethodGet, uri: "/v1/joinx"},
-		{uri: "/v1/join/abc", body: "x"},
 		{uri: "/v1/join/", body: "x"},
 		{method: http.MethodPut, uri: sigPostURI, body: "x"},
 		{method: http.MethodPost, uri: "/v1/join", body: "x"},
@@ -1083,6 +1083,49 @@ func TestSignal404sUnknownHostsAndPaths(t *testing.T) {
 		resp, _ := sigDo(t, addr, r)
 		require.NotNil(t, resp, r)
 		assert.Equal(t, http.StatusNotFound, resp.StatusCode, r)
+	}
+	assert.Equal(t, int32(0), f.backend.posts.Load())
+}
+
+// Mojang's NetherNet guide §9: a NetworkID is an opaque string whose format may
+// change (to a GUID, for one), so any single path segment is a join.
+func TestSignalTakesTheNetworkIDAsOneOpaqueSegment(t *testing.T) {
+	guid := "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	for _, c := range []struct{ uri, id string }{
+		{sigPostURI, "1234567890"},
+		{"/v1/join/" + guid, guid},
+		{"/v1/join/%7B" + guid + "%7D", "{" + guid + "}"},
+		{"/v1/join/" + strings.Repeat("a", 128), strings.Repeat("a", 128)},
+	} {
+		t.Run(c.uri, func(t *testing.T) {
+			f := newSigFixture(t)
+			resp, _ := sigDo(t, f.serve(t, 19132), sigReq{uri: c.uri, body: f.validOffer(t)})
+			require.NotNil(t, resp)
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+			f.backend.mu.Lock()
+			got := f.backend.uri
+			f.backend.mu.Unlock()
+			seg, ok := strings.CutPrefix(got, "/v1/join/")
+			require.True(t, ok, got)
+			assert.NotContains(t, seg, "/", "one segment")
+			id, err := url.PathUnescape(seg)
+			require.NoError(t, err)
+			assert.Equal(t, c.id, id, "the backend decodes the same ID")
+		})
+	}
+}
+
+func TestSignal404sAnIDThatIsNotOneSegment(t *testing.T) {
+	f := newSigFixture(t)
+	addr := f.serve(t, 19132)
+	for _, uri := range []string{
+		"/v1/join/", "/v1/join/.", "/v1/join/..", "/v1/join/%2E%2E", "/v1/join/a/b", "/v1/join/a%2Fb",
+		"/v1/join/a%20b", "/v1/join/a%09b", "/v1/join/a%00b", "/v1/join/a%7Fb", "/v1/join/a%C2%A0b",
+		"/v1/join/" + strings.Repeat("a", 129),
+	} {
+		resp, _ := sigDo(t, addr, sigReq{uri: uri, body: f.validOffer(t)})
+		require.NotNil(t, resp, uri)
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode, uri)
 	}
 	assert.Equal(t, int32(0), f.backend.posts.Load())
 }
