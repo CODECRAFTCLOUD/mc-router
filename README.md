@@ -5,6 +5,83 @@
 [![Discord](https://img.shields.io/discord/660567679458869252?label=discord)](https://discord.gg/JK2v3rJ9ec)
 [![Buy me a coffee](https://img.shields.io/badge/Donate-Buy%20me%20a%20coffee-orange.svg)](https://www.buymeacoffee.com/itzg)
 
+## About this fork
+
+This is [CODECRAFTCLOUD/mc-router](https://github.com/CODECRAFTCLOUD/mc-router), branch `uniz`. It is a fork of
+[itzg/mc-router](https://github.com/itzg/mc-router) that runs the game routing of [uniz.host](https://uniz.host). It
+branches from upstream `main` at `4a9ffa4` ("fix: nil default route panic when saving routes with no config file
+(#604)"). Everything below that heading is upstream's README, plus the [NetherNet router](#nethernet-router) section.
+
+The fork adds two things: changes to the Java router (`mc-router`), and a second binary, `nethernet-router`, for
+Bedrock.
+
+### Changes to the Java router
+
+**Wake messages and wake allowlists.** These apply when a player joins a server that `-auto-scale-up` has scaled to
+zero.
+
+- The player is kicked straight away with a message telling them to rejoin in a moment. Upstream holds the connection
+  open instead.
+  - The message comes from the Service annotation `mc-router.itzg.me/wakeMessage`, or a built-in default.
+  - While the backend boots, the router serves the loading MOTD.
+- `mc-router.itzg.me/autoScaleUpAllowList` is a comma-separated list of player names that may wake the server, matched
+  exactly.
+  - A player not on the list is kicked without waking the server.
+  - Without the annotation, upstream's `-auto-scale-allow-deny` rules apply.
+- A server that cannot be woken still answers status pings with its asleep MOTD.
+- The wake path no longer panics on a route that has no down-scaler.
+
+**Connection limits:**
+
+- `-connection-rate-limit` now limits new connections per second across all clients, default `200`. Upstream's default
+  is `1`, and it throttled the accept loop itself.
+- `-conn-rate-limit-per-ip` (env `CONN_RATE_LIMIT_PER_IP`) is new. It limits new connections per second from one
+  source IP, bursting to 4×, default `5`.
+- In both, `0` turns the limit off.
+
+**Backend dial timeout.** `-backend-dial-timeout` (env `BACKEND_DIAL_TIMEOUT`, default `2s`) bounds the TCP dial to a
+backend. A scaled-to-zero Service gets its asleep MOTD or scale-up fallback after this long, not after the operating
+system's dial timeout.
+
+### `nethernet-router`: hostname routing for Bedrock NetherNet
+
+From BDS 1.26.50, Bedrock Dedicated Server defaults to the NetherNet transport: WebRTC, with an HTTP signaling
+handshake on TCP. From 26.60, RakNet-only servers stop being reachable by current clients. `nethernet-router` gives
+NetherNet what `mc-router` gives Java: many servers behind one public IP and port, chosen by the hostname the player
+typed. Specifically, it:
+
+- answers the signaling on TCP 19132, over HTTP and TLS, and on each server's old pool port;
+- rewrites BDS's SDP answer to one public candidate;
+- relays the UDP to the right pod;
+- holds a join to an asleep server while the server is woken.
+
+Full flags and metrics are in [NetherNet router](#nethernet-router). Before you reuse it, know that some parts are
+specific to uniz.host:
+
+- **Routes** come from Kubernetes Services (with their EndpointSlices for the pod IPs) annotated with:
+  - `nethernet.uniz.host/serverName`: comma-separated hostnames;
+  - `nethernet.uniz.host/legacyPort`: the old `host:port` pool port, which is also the wake key;
+  - `nethernet.uniz.host/asleepMotd`;
+  - `nethernet.uniz.host/serverId`.
+- **Waking** calls the uniz.host API: `POST <api-url>/v1/internal/servers/bedrock/nethernet-wake`.
+  - Header: `X-NetherNet-Router-Token`.
+  - Body: `{"port", "xuid", "gamertag"}`.
+  - Answer: `{"success", "woken", "booting", "message"}`.
+
+  Any service that implements that contract works.
+- **A wake needs a verified Minecraft identity.** The player's Microsoft-signed token is checked against Microsoft's
+  JWKS. Status cards and joins to an awake server need nothing.
+- **It needs a public IPv4 literal** (`-public-ip`). It runs as its own DaemonSet, never inside the Java router's pods.
+  An optional Redis (`-redis-addr`) shares sessions between replicas.
+
+### Building
+
+`docker build .` produces one image holding both binaries. Its entrypoint is `/mc-router`; run the NetherNet router
+with `command: ["/nethernet-router"]`. The image is built by hand, with no CI on this branch. uniz.host runs
+`ghcr.io/codecraftcloud/mc-router:<commit>`.
+
+---
+
 Routes Minecraft Java Edition client connections to backend servers based upon the requested server address. This is quite helpful for home network deployments where any number of Minecraft servers can be multiplexed onto a single, public IP address and standard Minecraft port. It works great with [itzg/minecraft-server](https://github.com/itzg/docker-minecraft-server), but can be used with any Minecraft server. Stand-alone binaries are also published for Linux, Mac, and Windows if not wanting to use containers at all.
 
 Some other features included:
