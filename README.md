@@ -964,7 +964,7 @@ Every flag can also be set by its `NETHERNET_<NAME>` environment variable (the p
   - `answered`: a join's SDP answer, rewritten to the public candidate, returned with 200.
   - `forwarded`: an awake server's card (`GET /v1/join`) passed through with BDS's own status.
   - `asleep_card`: the router's own card for an asleep server.
-  - `backend_status`: BDS refused the offer; its status is returned, never its body.
+  - `backend_status`: BDS refused the first forward of an offer; its status is returned, never its body. A refused retry is `bad_gateway`, counted in `nethernet_answer_retries_total{outcome="exhausted"}`.
   - `bad_gateway`: a 502. The forward failed, the route went away, the answer could not be parsed, rewritten or registered, or it never named the pod.
   - `session_cap`: the relay's session caps refused the join (503).
   - `unavailable`: a wake hold ended without a ready server (503); `nethernet_wake_holds_total` says why.
@@ -1004,7 +1004,7 @@ Every flag can also be set by its `NETHERNET_<NAME>` environment variable (the p
   - `c`: a client by address.
 - `nethernet_answer_retries_total{outcome}` (counter): joins whose answer had no candidate at the pod address and whose offer was forwarded again.
   - `recovered`: a later answer named the pod and its session was registered.
-  - `exhausted`: the join ended in a 502: the forwards ran out, the join's time ran out, or a retry forward failed.
+  - `exhausted`: the join ended in a 502: the forwards ran out, the join's time ran out, or a retry forward failed, was refused (non-2xx) or got an answer that does not parse. A client that hung up is never counted.
 
 ## Community Solutions
 
