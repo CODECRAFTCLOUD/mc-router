@@ -956,6 +956,56 @@ Every flag can also be set by its `NETHERNET_<NAME>` environment variable (the p
 | `-metrics-binding` | `NETHERNET_METRICS_BINDING` | `:8080` | `host:port` that serves `/metrics` and `/healthz` only. |
 | `-debug` | `NETHERNET_DEBUG` | `false` | Enable debug logs. |
 
+### Metrics
+
+`/metrics` on `-metrics-binding` serves the router's own registry, with these series:
+
+- `nethernet_signaling_requests_total{transport, result}` (counter): signaling requests by transport (`tls`, `http`; empty when refused before a byte is read) and result.
+  - `answered`: a join's SDP answer, rewritten to the public candidate, returned with 200.
+  - `forwarded`: an awake server's card (`GET /v1/join`) passed through with BDS's own status.
+  - `asleep_card`: the router's own card for an asleep server.
+  - `backend_status`: BDS refused the offer; its status is returned, never its body.
+  - `bad_gateway`: a 502. The forward failed, the route went away, the answer could not be parsed, rewritten or registered, or it never named the pod.
+  - `session_cap`: the relay's session caps refused the join (503).
+  - `unavailable`: a wake hold ended without a ready server (503); `nethernet_wake_holds_total` says why.
+  - `forbidden`: the join had no verified Minecraft identity (403).
+  - `not_found`: an unknown host, path or method (404).
+  - `too_large`: the body is over `-max-body` (413).
+  - `bad_request`: the request could not be read; no response is sent.
+  - `rate_limited`: refused by a `-signal-rate-*` limit before anything was read.
+  - `tls_refused`: the SNI is not served; the client gets `handshake_failure`.
+- `nethernet_tls_handshakes_total{outcome}` (counter): TLS handshakes on the signaling port.
+  - `ok`: the handshake completed.
+  - `failed`: the handshake itself failed.
+  - `refused_sni`: no served certificate for the SNI.
+- `nethernet_wake_holds_total{outcome}` (counter): joins to an asleep server, held for a wake.
+  - `ready`: the server came up within the hold and the join went on.
+  - `timeout`: `-wake-hold` ran out.
+  - `cancelled`: the client hung up.
+  - `refused`: the API refused the wake, or the call failed.
+  - `player_limit`: the player reached `-wake-limit-per-player`.
+  - `identity_rejected`: the join had no verified Minecraft identity; nothing was woken.
+  - `no_legacy_port`: the server has no legacy pool port, which the wake API is keyed by.
+- `nethernet_sessions{server, state}` (gauge): relay sessions on this replica.
+  - `signaled`: the answer is registered and the session waits for its first verified STUN check.
+  - `bound`: the session is relaying.
+- `nethernet_udp_dropped_total{reason}` (counter): UDP datagrams the relay dropped.
+  - `unknown_peer`: no session for the datagram's STUN username or source address (a shared-registry lookup may be queued, and the client's retransmit retries), or a non-STUN datagram for a session already bound to another address.
+  - `bad_username`: a STUN username too long to look up.
+  - `bad_integrity`: a check whose MESSAGE-INTEGRITY does not verify with the session's ice-pwd.
+  - `pair_mismatch`: a bound address sent a check for another pair.
+  - `hard_reaped`: a session from another replica older than `-hard-reap`.
+  - `session_cap`: adopting a session from another replica would pass a session cap.
+  - `dial_failed`: the relay could not dial BDS.
+- `nethernet_registry_errors_total` (counter): errors from the shared session registry.
+- `nethernet_registry_queue_full_total` (counter): shared-registry writes skipped because the worker queue was full; the datagram is still forwarded.
+- `nethernet_registry_lookups_dropped_total{kind}` (counter): shared-registry lookups skipped because their budget or queue was full; the client's retransmit retries.
+  - `s`: a session by STUN username.
+  - `c`: a client by address.
+- `nethernet_answer_retries_total{outcome}` (counter): joins whose answer had no candidate at the pod address and whose offer was forwarded again.
+  - `recovered`: a later answer named the pod and its session was registered.
+  - `exhausted`: the join ended in a 502: the forwards ran out, the join's time ran out, or a retry forward failed.
+
 ## Community Solutions
 
 - **[MC Router Discovery](https://github.com/Seedloaf/mc-router-discovery):** A lightweight sidecar to ensure mc-router is in sync with your list of running servers.
