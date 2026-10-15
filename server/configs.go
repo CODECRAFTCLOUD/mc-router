@@ -10,13 +10,14 @@ type WebhookConfig struct {
 }
 
 type AutoScale struct {
-	Up          bool          `usage:"Scale from zero on access. For Kubernetes, increases StatefulSet replicas from 0 to 1. For Docker, starts or unpauses the container when accessed"`
-	Down        bool          `default:"false" usage:"Scale to zero after idle. For Kubernetes, decreases StatefulSet replicas from 1 to 0. For Docker, gracefully stops the container when there are no connections"`
-	DownAfter   time.Duration `default:"10m" usage:"Server scale down delay after there are no connections"`
-	AllowDeny   string        `usage:"Path to config for server allowlists and denylists. If a global/server entry is specified, only players allowed to connect to the server will be able to trigger a scale up when -auto-scale-up is enabled or cancel active down scalers when -auto-scale-down is enabled"`
-	AsleepMOTD  string        `usage:"MOTD to display when auto-scaled down servers are accessed; if empty, no status will be served"`
-	LoadingMOTD string        `usage:"MOTD to display while auto-scaled Docker servers are waking up; if empty, asleep status will be served"`
-	Webhook     AutoScaleWebhookConfig
+	Up                    bool          `usage:"Scale from zero on access. For Kubernetes, increases StatefulSet replicas from 0 to 1. For Docker, starts or unpauses the container when accessed"`
+	Down                  bool          `default:"false" usage:"Scale to zero after idle. For Kubernetes, decreases StatefulSet replicas from 1 to 0. For Docker, gracefully stops the container when there are no connections"`
+	DownAfter             time.Duration `default:"10m" usage:"Server scale down delay after there are no connections"`
+	StatusResetsDownTimer bool          `default:"false" usage:"Reset the scale down timer when status requests are proxied; by default only player login connections reset it"`
+	AllowDeny             string        `usage:"Path to config for server allowlists and denylists. If a global/server entry is specified, only players allowed to connect to the server will be able to trigger a scale up when -auto-scale-up is enabled or cancel active down scalers when -auto-scale-down is enabled"`
+	AsleepMOTD            string        `usage:"MOTD to display when auto-scaled down servers are accessed; if empty, no status will be served"`
+	LoadingMOTD           string        `usage:"MOTD to display while auto-scaled Docker servers are waking up; if empty, asleep status will be served"`
+	Webhook               AutoScaleWebhookConfig
 }
 
 // AutoScaleWebhookConfig enables scaling of statically-configured routes by
@@ -62,6 +63,7 @@ type Config struct {
 	MetricsRateLimitPeriod time.Duration `default:"1s" usage:"The period at which the rate limit bucket's metrics are set: 0 to disable (default 1s)"`
 	UseProxyProtocol       bool          `default:"false" usage:"Send PROXY protocol to backend servers"`
 	ReceiveProxyProtocol   bool          `default:"false" usage:"Receive PROXY protocol from backend servers, by default trusts every proxy header that it receives, combine with -trusted-proxies to specify a list of trusted proxies"`
+	DynamicProxyProtocol   bool          `default:"false" usage:"Accept connections with or without PROXY protocol. When a connection supplies a PROXY header, it is forwarded to the backend. Cannot be combined with -receive-proxy-protocol or -use-proxy-protocol"`
 	TrustedProxies         []string      `usage:"Comma delimited list of CIDR notation IP blocks to trust when receiving PROXY protocol"`
 	RecordLogins           bool          `default:"false" usage:"Log and generate metrics on player logins. Metrics only supported with influxdb or prometheus backend"`
 	Routes                 RoutesConfig

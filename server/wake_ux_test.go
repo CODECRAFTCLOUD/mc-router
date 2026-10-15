@@ -53,7 +53,7 @@ func readLoginDisconnect(r net.Conn) (string, bool) {
 func TestFindAndConnectBackendWakeKick(t *testing.T) {
 	newConn := func(routes IRoutes) *Connector {
 		return NewConnector(t.Context(), routes, NewDownScaler(false, 5*time.Second),
-			discardMetricsBuilder{}.BuildConnectorMetrics(), false, false, nil)
+			discardMetricsBuilder{}.BuildConnectorMetrics(), false, false, nil, false)
 	}
 	// A login to an autoScaleUp service, driven straight through
 	// findAndConnectBackend (which receives the already-parsed playerInfo).
@@ -153,7 +153,7 @@ func TestWakeAllowlistAppliesToAnUnnormalizedHost(t *testing.T) {
 		routes.CreateMapping("survival.uniz.host", "127.0.0.1:1", nil, waker, nil, "", "")
 		routes.SetWakeConfig("survival.uniz.host", "custom wake", []string{"steve"})
 		return NewConnector(t.Context(), routes, NewDownScaler(false, 5*time.Second),
-			discardMetricsBuilder{}.BuildConnectorMetrics(), false, false, nil), woke
+			discardMetricsBuilder{}.BuildConnectorMetrics(), false, false, nil, false), woke
 	}
 	drive := func(c *Connector, address, playerName string) net.Conn {
 		frontend, tr := net.Pipe()

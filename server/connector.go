@@ -16,11 +16,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/avast/retry-go/v5"
+	"github.com/pires/go-proxyproto"
 	"golang.ngrok.com/ngrok"
 	"golang.ngrok.com/ngrok/config"
 
 	"github.com/itzg/mc-router/mcproto"
-	"github.com/pires/go-proxyproto"
 	"github.com/sirupsen/logrus"
 )
 
@@ -88,7 +88,7 @@ func (sm *ActiveConnections) GetCount(backendAddress string) int {
 	return 0
 }
 
-func NewConnector(ctx context.Context, routes IRoutes, downScaler IDownScaler, metrics *ConnectorMetrics, sendProxyProto bool, recordLogins bool, autoScaleUpAllowDenyConfig *AllowDenyConfig) *Connector {
+func NewConnector(ctx context.Context, routes IRoutes, downScaler IDownScaler, metrics ConnectorMetrics, sendProxyProto bool, recordLogins bool, autoScaleUpAllowDenyConfig *AllowDenyConfig, statusResetsDownTimer bool) *Connector {
 
 	return &Connector{
 		ctx:                        ctx,
@@ -99,6 +99,7 @@ func NewConnector(ctx context.Context, routes IRoutes, downScaler IDownScaler, m
 		connectionsCond:            sync.NewCond(&sync.Mutex{}),
 		recordLogins:               recordLogins,
 		autoScaleUpAllowDenyConfig: autoScaleUpAllowDenyConfig,
+		statusResetsDownTimer:      statusResetsDownTimer,
 		activeConnections:          NewActiveConnections(),
 		scaleActiveConnections:     NewActiveConnections(),
 		wakingServers:              NewActiveConnections(),
@@ -128,9 +129,11 @@ type Connector struct {
 	routes IRoutes
 	// downScaler is used to scale up and down the number of backend connections. nil if disabled.
 	downScaler                 IDownScaler
-	metrics                    *ConnectorMetrics
+	statusResetsDownTimer      bool
+	metrics                    ConnectorMetrics
 	sendProxyProto             bool
 	receiveProxyProto          bool
+	dynamicProxyProto          bool
 	recordLogins               bool
 	trustedProxyNets           []*net.IPNet
 	totalActiveConnections     int32
@@ -231,6 +234,13 @@ func (c *Connector) createProxyProtoPolicy() proxyproto.ConnPolicyFunc {
 	}
 }
 
+func frontendProxyHeader(conn net.Conn) *proxyproto.Header {
+	if proxyConn, ok := conn.(*proxyproto.Conn); ok {
+		return proxyConn.ProxyHeader()
+	}
+	return nil
+}
+
 func (c *Connector) WaitForConnections() {
 	c.connectionsCond.L.Lock()
 	defer c.connectionsCond.L.Unlock()
@@ -295,14 +305,14 @@ func (c *Connector) rateLimitMetrics(period time.Duration) {
 			return
 		case <-ticker.C:
 			if c.connRateLimiter != nil && c.connRateLimiter.global != nil {
-				c.metrics.RateLimitAvailable.Set(c.connRateLimiter.global.Tokens())
+				c.metrics.SetRateLimitAvailable(int64(c.connRateLimiter.global.Tokens()))
 			}
 		}
 	}
 }
 
 func (c *Connector) HandleConnection(frontendConn net.Conn) {
-	c.metrics.ConnectionsFrontend.Add(1)
+	c.metrics.IncrementConnectionsFrontend()
 	//noinspection GoUnhandledErrorResult
 	defer frontendConn.Close()
 
@@ -320,7 +330,7 @@ func (c *Connector) HandleConnection(frontendConn net.Conn) {
 		if c.connRateLimiter != nil {
 			allow, scope, logIt := c.connRateLimiter.allow(tcpAddr.AddrPort().Addr(), time.Now())
 			if !allow {
-				c.metrics.Errors.With("type", "rate_limited").Add(1)
+				c.metrics.IncrementErrors("rate_limited")
 				if logIt {
 					logrus.
 						WithField("client", clientAddr).
@@ -350,13 +360,13 @@ func (c *Connector) HandleConnection(frontendConn net.Conn) {
 			WithError(err).
 			WithField("client", clientAddr).
 			Error("Failed to set read deadline")
-		c.metrics.Errors.With("type", "read_deadline").Add(1)
+		c.metrics.IncrementErrors("read_deadline")
 		return
 	}
 	packet, err := mcproto.ReadPacket(bufferedReader, clientAddr, c.state)
 	if err != nil {
 		logrus.WithError(err).WithField("clientAddr", clientAddr).Error("Failed to read packet")
-		c.metrics.Errors.With("type", "read").Add(1)
+		c.metrics.IncrementErrors("read")
 		return
 	}
 
@@ -371,13 +381,14 @@ func (c *Connector) HandleConnection(frontendConn net.Conn) {
 		if err != nil {
 			logrus.WithError(err).WithField("clientAddr", clientAddr).
 				Error("Failed to read handshake")
-			c.metrics.Errors.With("type", "read").Add(1)
+			c.metrics.IncrementErrors("read")
 			return
 		}
 
 		logrus.
 			WithField("client", clientAddr).
 			WithField("handshake", handshake).
+			WithField("nextState", handshake.NextState).
 			Debug("Got handshake")
 
 		var playerInfo *PlayerInfo = nil
@@ -395,7 +406,7 @@ func (c *Connector) HandleConnection(frontendConn net.Conn) {
 						WithError(err).
 						WithField("clientAddr", clientAddr).
 						Error("Failed to read user info")
-					c.metrics.Errors.With("type", "read").Add(1)
+					c.metrics.IncrementErrors("read")
 					return
 				}
 			}
@@ -414,7 +425,7 @@ func (c *Connector) HandleConnection(frontendConn net.Conn) {
 				WithField("client", clientAddr).
 				WithField("packet", packet).
 				Warn("Unexpected data type for PacketIdLegacyServerListPing")
-			c.metrics.Errors.With("type", "unexpected_content").Add(1)
+			c.metrics.IncrementErrors("unexpected_content")
 			return
 		}
 
@@ -431,7 +442,7 @@ func (c *Connector) HandleConnection(frontendConn net.Conn) {
 			WithField("client", clientAddr).
 			WithField("packetID", packet.PacketID).
 			Error("Unexpected packetID, expected handshake")
-		c.metrics.Errors.With("type", "unexpected_content").Add(1)
+		c.metrics.IncrementErrors("unexpected_content")
 		return
 	}
 }
@@ -591,24 +602,21 @@ func (c *Connector) cleanupBackendConnection(
 	}
 
 	if cleanupMetrics {
-		c.metrics.ActiveConnections.Set(float64(
-			atomic.AddInt32(&c.totalActiveConnections, -1)))
+		c.metrics.SetActiveConnections(atomic.AddInt32(&c.totalActiveConnections, -1))
 
 		c.activeConnections.Decrement(backendHostPort)
-		c.metrics.ServerActiveConnections.
-			With("server_address", sanitizeUTF8(serverAddress)).
-			Set(float64(c.activeConnections.GetCount(backendHostPort)))
+		c.metrics.SetServerActiveConnections(sanitizeUTF8(serverAddress), c.activeConnections.GetCount(backendHostPort))
 
 		if scalingTarget != nil {
 			c.scaleActiveConnections.Decrement(scalingTarget.ScalingKey())
 		}
 
 		if c.recordLogins && playerInfo != nil {
-			c.metrics.ServerActivePlayer.
-				With("player_name", sanitizeUTF8(playerInfo.Name)).
-				With("player_uuid", sanitizeUTF8(playerInfo.Uuid.String())).
-				With("server_address", sanitizeUTF8(serverAddress)).
-				Set(0)
+			c.metrics.SetServerActivePlayerCounts(
+				sanitizeUTF8(playerInfo.Name),
+				sanitizeUTF8(playerInfo.Uuid.String()),
+				sanitizeUTF8(serverAddress),
+				0)
 		}
 	}
 	logrus.
@@ -715,12 +723,12 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			c.wakingServers.Decrement(serverAddress)
 			if err != nil {
 				logrus.WithFields(logrus.Fields{"serverAddress": serverAddress}).WithError(err).Error("failed to wake up backend")
-				c.metrics.Errors.With("type", "wakeup_failed").Add(1)
+				c.metrics.IncrementErrors("wakeup_failed")
 				return
 			}
 			if newBackendHostPort == "" {
 				logrus.WithFields(logrus.Fields{"serverAddress": serverAddress}).Warn("waker did not return a backend address")
-				c.metrics.Errors.With("type", "wakeup_no_address").Add(1)
+				c.metrics.IncrementErrors("wakeup_no_address")
 				return
 			}
 			backendHostPort = newBackendHostPort
@@ -738,7 +746,7 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 				WithField("resolvedHost", resolvedHost).
 				WithField("player", playerInfo).
 				Warn("Unable to find registered backend")
-			c.metrics.Errors.With("type", "missing_backend").Add(1)
+			c.metrics.IncrementErrors("missing_backend")
 		}
 
 		if c.connectionNotifier != nil {
@@ -798,7 +806,7 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			WithField("backend", backendHostPort).
 			WithField("player", playerInfo).
 			Warn("Unable to connect to backend")
-		c.metrics.Errors.With("type", "backend_failed").Add(1)
+		c.metrics.IncrementErrors("backend_failed")
 
 		if waker != nil {
 			logrus.WithField("serverAddress", serverAddress).
@@ -846,26 +854,24 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 		}
 	}
 
-	c.metrics.ConnectionsBackend.With("host", sanitizeUTF8(resolvedHost)).Add(1)
+	c.metrics.IncrementConnectionsBackend(sanitizeUTF8(resolvedHost))
 
-	c.metrics.ActiveConnections.Set(float64(
-		atomic.AddInt32(&c.totalActiveConnections, 1)))
+	c.metrics.SetActiveConnections(atomic.AddInt32(&c.totalActiveConnections, 1))
 
 	c.activeConnections.Increment(backendHostPort)
 	if scalingTarget != nil {
 		c.scaleActiveConnections.Increment(scalingTarget.ScalingKey())
-		// Cancel any pending scale-down timer — the Docker event that fires during
-		// wake-up may have started a new timer after our pre-wake Cancel call.
-		// Also covers status pings: they cancel the timer here, and cleanupCheckScaleDown
-		// ensures the timer is restarted when the ping connection closes.
-		if c.downScaler != nil {
+		// Status connections only reset the timer when explicitly configured.
+		if (nextState == mcproto.StateLogin || (nextState == mcproto.StateStatus && c.statusResetsDownTimer)) && c.downScaler != nil {
+			// The Docker event that fires during wake-up may have started a new
+			// timer after our pre-wake Cancel call.
 			c.downScaler.Cancel(scalingTarget)
 			cleanupCheckScaleDown = true
 		}
 	}
-	c.metrics.ServerActiveConnections.
-		With("server_address", sanitizeUTF8(serverAddress)).
-		Set(float64(c.activeConnections.GetCount(backendHostPort)))
+	c.metrics.SetServerActiveConnections(
+		sanitizeUTF8(serverAddress),
+		c.activeConnections.GetCount(backendHostPort))
 
 	if c.recordLogins && playerInfo != nil {
 		logrus.
@@ -874,22 +880,22 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			WithField("serverAddress", serverAddress).
 			Info("Player attempted to login to server")
 
-		c.metrics.ServerActivePlayer.
-			With("player_name", sanitizeUTF8(playerInfo.Name)).
-			With("player_uuid", sanitizeUTF8(playerInfo.Uuid.String())).
-			With("server_address", sanitizeUTF8(serverAddress)).
-			Set(1)
+		c.metrics.SetServerActivePlayerCounts(
+			sanitizeUTF8(playerInfo.Name),
+			sanitizeUTF8(playerInfo.Uuid.String()),
+			sanitizeUTF8(serverAddress),
+			1)
 
-		c.metrics.ServerLogins.
-			With("player_name", sanitizeUTF8(playerInfo.Name)).
-			With("player_uuid", sanitizeUTF8(playerInfo.Uuid.String())).
-			With("server_address", sanitizeUTF8(serverAddress)).
-			Add(1)
+		c.metrics.IncrementServerLogins(
+			sanitizeUTF8(playerInfo.Name),
+			sanitizeUTF8(playerInfo.Uuid.String()),
+			sanitizeUTF8(serverAddress))
 	}
 
 	cleanupMetrics = true
 
 	// PROXY protocol implementation
+	var header *proxyproto.Header
 	if c.sendProxyProto {
 
 		// Determine transport protocol for the PROXY header by "analyzing" the frontend connection's address
@@ -908,14 +914,18 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			transportProtocol = proxyproto.TCPv6
 		}
 
-		header := &proxyproto.Header{
+		header = &proxyproto.Header{
 			Version:           2,
 			Command:           proxyproto.PROXY,
 			TransportProtocol: transportProtocol,
 			SourceAddr:        clientAddr,
 			DestinationAddr:   frontendConn.LocalAddr(), // our end of the client's connection
 		}
+	} else if c.dynamicProxyProto {
+		header = frontendProxyHeader(frontendConn)
+	}
 
+	if header != nil {
 		_, err = header.WriteTo(backendConn)
 		if err != nil {
 			logrus.
@@ -923,7 +933,7 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 				WithField("clientAddr", header.SourceAddr).
 				WithField("destAddr", header.DestinationAddr).
 				Error("Failed to write PROXY header")
-			c.metrics.Errors.With("type", "proxy_write").Add(1)
+			c.metrics.IncrementErrors("proxy_write")
 			_ = backendConn.Close()
 			return
 		}
@@ -932,7 +942,7 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 	amount, err := io.Copy(backendConn, preReadContent)
 	if err != nil {
 		logrus.WithError(err).Error("Failed to write handshake to backend connection")
-		c.metrics.Errors.With("type", "backend_failed").Add(1)
+		c.metrics.IncrementErrors("backend_failed")
 		_ = backendConn.Close()
 		return
 	}
@@ -943,7 +953,7 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			WithError(err).
 			WithField("client", clientAddr).
 			Error("Failed to clear read deadline")
-		c.metrics.Errors.With("type", "read_deadline").Add(1)
+		c.metrics.IncrementErrors("read_deadline")
 		_ = backendConn.Close()
 		return
 	}
@@ -969,7 +979,7 @@ func (c *Connector) pumpConnections(frontendConn, backendConn net.Conn, playerIn
 			logrus.WithError(err).
 				WithField("client", clientAddr).
 				Error("Error observed on connection relay")
-			c.metrics.Errors.With("type", "relay").Add(1)
+			c.metrics.IncrementErrors("relay")
 		}
 
 	case <-c.ctx.Done():
@@ -986,7 +996,7 @@ func (c *Connector) pumpFrames(incoming io.Reader, outgoing io.Writer, errors ch
 		WithField("player", playerInfo).
 		Infof("Finished relay %s->%s", from, to)
 
-	c.metrics.BytesTransmitted.Add(float64(amount))
+	c.metrics.AddBytesTransmitted(amount)
 
 	if err != nil {
 		errors <- err
@@ -1004,6 +1014,12 @@ func (c *Connector) UseNgrok(config NgrokConfig) {
 func (c *Connector) UseReceiveProxyProto(trustedProxyNets []*net.IPNet) {
 	c.trustedProxyNets = trustedProxyNets
 	c.receiveProxyProto = true
+}
+
+func (c *Connector) UseDynamicProxyProtocol(trustedProxyNets []*net.IPNet) {
+	c.trustedProxyNets = trustedProxyNets
+	c.receiveProxyProto = true
+	c.dynamicProxyProto = true
 }
 
 // UseAsleepMOTD configures a predefined MOTD to serve when backends are asleep

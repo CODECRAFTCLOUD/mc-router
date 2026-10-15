@@ -34,7 +34,7 @@ func statusPingForMOTD(t *testing.T, waker WakerFunc, routeMOTD string, globalMO
 	routes.CreateMapping("mc.example.com", backendAddress, scalingTarget, waker, nil, routeMOTD, "")
 
 	metricsBuilder := discardMetricsBuilder{}
-	c := NewConnector(t.Context(), routes, downScaler, metricsBuilder.BuildConnectorMetrics(), false, false, nil)
+	c := NewConnector(t.Context(), routes, downScaler, metricsBuilder.BuildConnectorMetrics(), false, false, nil, false)
 	c.UseAsleepMOTD(globalMOTD)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

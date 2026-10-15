@@ -25,7 +25,7 @@ func TestWakePathWithNilDownScaler(t *testing.T) {
 
 	metricsBuilder := discardMetricsBuilder{}
 	// nil down-scaler — exactly what server.go builds without --auto-scale-down.
-	c := NewConnector(t.Context(), routes, nil, metricsBuilder.BuildConnectorMetrics(), false, false, nil)
+	c := NewConnector(t.Context(), routes, nil, metricsBuilder.BuildConnectorMetrics(), false, false, nil, false)
 	c.UseBackendDialTimeout(50 * time.Millisecond)
 
 	client, frontend := net.Pipe()
