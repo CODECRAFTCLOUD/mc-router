@@ -10,7 +10,8 @@
 This is [CODECRAFTCLOUD/mc-router](https://github.com/CODECRAFTCLOUD/mc-router), branch `uniz`. It is a fork of
 [itzg/mc-router](https://github.com/itzg/mc-router) that runs the game routing of [uniz.host](https://uniz.host). It
 branches from upstream `main` at `4a9ffa4` ("fix: nil default route panic when saving routes with no config file
-(#604)"). Everything below that heading is upstream's README, plus the [NetherNet router](#nethernet-router) section.
+(#604)"), and was last merged with upstream `main` at `b430a6b` ("Update all non-major dependencies (#627)") on
+2026-10-15. Everything below that heading is upstream's README, plus the [NetherNet router](#nethernet-router) section.
 
 The fork adds two things: changes to the Java router (`mc-router`), and a second binary, `nethernet-router`, for
 Bedrock.
@@ -26,6 +27,8 @@ zero.
   - While the backend boots, the router serves the loading MOTD.
 - `mc-router.itzg.me/autoScaleUpAllowList` is a comma-separated list of player names that may wake the server, matched
   exactly.
+  - The list is looked up by the hostname routing resolved, so a handshake address with different case, a trailing dot
+    or a Forge `\0FML…\0` suffix still meets it.
   - A player not on the list is kicked without waking the server.
   - Without the annotation, upstream's `-auto-scale-allow-deny` rules apply.
 - A server that cannot be woken still answers status pings with its asleep MOTD.
