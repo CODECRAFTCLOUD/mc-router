@@ -528,7 +528,9 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 	off, err := ParseSDP(string(offer)) // an offer the router can never register is never forwarded
 	if err != nil {
 		b, _ := s.route(req.Host, j.localPort) // for the log's serverId only
-		fail(b, "offer", err)
+		// Debug: any anonymous caller can send one, as often as the rate limits allow.
+		logrus.WithError(err).WithField("serverId", b.ServerID).Debug("nethernet: answer refused: offer")
+		j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
 		return
 	}
 	retry, cancel := context.WithDeadline(ctx, j.start.Add(s.o.WakeHold))

@@ -1518,6 +1518,8 @@ func TestSignalCountsARecoveryOnlyOnceTheSessionIsRegistered(t *testing.T) {
 }
 
 func TestSignalRefusesAMalformedOfferBeforeForwardingIt(t *testing.T) {
+	hook := logrustest.NewGlobal()
+	t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{}) })
 	f := newSigFixture(t)
 	f.backend.setAnswer(func(n int32) string { return noPodAnswer(t, n) })
 	addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
@@ -1526,6 +1528,9 @@ func TestSignalRefusesAMalformedOfferBeforeForwardingIt(t *testing.T) {
 	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
 	assert.NotContains(t, body, "a=candidate")
 	assert.Equal(t, int32(0), f.backend.posts.Load(), "an offer the router can never register is never forwarded")
+	for _, e := range hook.AllEntries() {
+		assert.Greater(t, e.Level, logrus.WarnLevel, "an anonymous caller controls the offer, so it never writes a Warn: %s", e.Message)
+	}
 }
 
 func TestSignalStopsRetryingWhenTheClientHangsUp(t *testing.T) {
