@@ -1529,6 +1529,8 @@ func TestSignalRefusesAMalformedOfferBeforeForwardingIt(t *testing.T) {
 }
 
 func TestSignalStopsRetryingWhenTheClientHangsUp(t *testing.T) {
+	hook := logrustest.NewGlobal()
+	t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{}) })
 	f := newSigFixture(t)
 	f.opts.WakeHold = 10 * time.Second
 	f.backend.setAnswer(func(n int32) string { return noPodAnswer(t, n) })
@@ -1542,6 +1544,7 @@ func TestSignalStopsRetryingWhenTheClientHangsUp(t *testing.T) {
 	assert.Equal(t, int32(1), posts, "the hang-up ends the wait before the next forward")
 	assert.Equal(t, posts, f.backend.posts.Load(), "no forward after the hang-up")
 	assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")), "a hang-up is not a failed retry")
+	assert.Empty(t, noPodWarns(hook), "nor a backend failure: the player cancelled")
 }
 
 // noPodWarns returns the errors of the Warn lines that end a join on a no-pod answer.

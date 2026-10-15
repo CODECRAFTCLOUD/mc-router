@@ -548,7 +548,12 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 	// retries (last): the metric, that answer's candidate IPs next to its
 	// Service's pod IPs, and a 502.
 	exhausted := func(last string) {
-		if forwards > 1 && ctx.Err() == nil { // only a re-forwarded join is a retry outcome, and a hang-up is none
+		if ctx.Err() != nil { // the player hung up: never a retry outcome, never a backend failure
+			logrus.WithFields(logrus.Fields{"serverId": noPodB.ServerID, "forwards": forwards}).Debug("nethernet: client hung up while the answer was retried")
+			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
+			return
+		}
+		if forwards > 1 { // only a re-forwarded join is a retry outcome
 			s.o.Metrics.answerRetry("exhausted")
 		}
 		cands := make([]netip.Addr, 0, len(noPodAns.Candidates)) // IPs only: no ports, no ufrag
