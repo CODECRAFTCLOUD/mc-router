@@ -654,7 +654,9 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			// fire the wake in the BACKGROUND (the k8s waker blocks up to waitTimeout,
 			// so a synchronous call would outlast the client's login timeout), then
 			// kick with a clear message instead of silently holding.
-			if !c.playerAllowedToWake(serverAddress, playerInfo) {
+			// Look up by the normalized host routing resolved, not the raw handshake
+			// address (case, trailing dot, Forge suffix would miss the allowlist).
+			if !c.playerAllowedToWake(resolvedHost, playerInfo) {
 				_ = mcproto.WriteLoginDisconnect(frontendConn, wakeDenyJSON())
 				return
 			}
@@ -677,7 +679,7 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 				defer c.wakingServers.Decrement(serverAddress)
 				_, _ = waker(c.ctx)
 			}()
-			_ = mcproto.WriteLoginDisconnect(frontendConn, wakeMessageJSON(c.routes.GetWakeMessage(serverAddress)))
+			_ = mcproto.WriteLoginDisconnect(frontendConn, wakeMessageJSON(c.routes.GetWakeMessage(resolvedHost)))
 			return
 		}
 
