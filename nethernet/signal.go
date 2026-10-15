@@ -545,11 +545,13 @@ func (j *join) answer(ctx context.Context, req *http.Request, offer []byte) {
 		}
 		resp, answer, err = s.forward(fctx, cur, req, offer)
 		if err != nil {
-			if forwards > 1 && ctx.Err() == nil && retry.Err() != nil { // the join's deadline cut a retry short
+			logrus.WithError(err).WithFields(logrus.Fields{"serverId": cur.ServerID, "forwards": forwards}).Debug("nethernet: offer forward failed")
+			// A retry that fails for any reason (the join's deadline, its own
+			// forwardTimeout, a dropped connection) ends on the last no-pod answer.
+			if forwards > 1 && ctx.Err() == nil {
 				exhausted()
 				return
 			}
-			logrus.WithError(err).WithFields(logrus.Fields{"serverId": cur.ServerID, "forwards": forwards}).Debug("nethernet: offer forward failed")
 			j.reply(http.StatusBadGateway, nil, nil, "bad_gateway")
 			return
 		}

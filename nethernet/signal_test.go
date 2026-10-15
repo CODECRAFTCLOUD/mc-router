@@ -1343,6 +1343,40 @@ func TestSignalGivesUpOnAnAnswerThatNeverNamesThePod(t *testing.T) {
 		assert.Contains(t, logged[0], "pods ["+sigPodIP+"]")
 		assert.Contains(t, logged[0], "10.0.0.77", "next to the answer's candidate IPs")
 	})
+	t.Run("when a retry forward fails for any other reason", func(t *testing.T) {
+		hook := logrustest.NewGlobal()
+		t.Cleanup(func() { logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{}) })
+		f := newSigFixture(t)
+		f.backend.setAnswer(func(n int32) string {
+			if n > 1 { // BDS drops the retry's connection, well within the join's deadline
+				panic(http.ErrAbortHandler)
+			}
+			return noPodAnswer(t, n)
+		})
+		addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+		assert.Equal(t, int32(2), f.backend.posts.Load())
+		assert.Equal(t, 1.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
+		warned := 0
+		for _, e := range hook.AllEntries() {
+			if e.Level == logrus.WarnLevel && strings.Contains(e.Message, "no candidate at the pod address") {
+				warned++
+			}
+		}
+		assert.Equal(t, 1, warned, "the final failure is logged")
+	})
+	t.Run("not when the first forward fails", func(t *testing.T) {
+		f := newSigFixture(t)
+		f.backend.setAnswer(func(int32) string { panic(http.ErrAbortHandler) })
+		addr := f.serve(t, 19132, fastRetry(20*time.Millisecond))
+		resp, _ := sigDo(t, addr, sigReq{body: f.validOffer(t)})
+		require.NotNil(t, resp)
+		assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+		assert.Equal(t, int32(1), f.backend.posts.Load(), "a failed first forward is never retried")
+		assert.Equal(t, 0.0, testutil.ToFloat64(f.metrics.AnswerRetries.WithLabelValues("exhausted")))
+	})
 	t.Run("with no time left for a retry", func(t *testing.T) {
 		f := newSigFixture(t)
 		f.opts.WakeHold = 10 * time.Millisecond
