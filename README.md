@@ -22,7 +22,7 @@ zero.
 
 - The player is kicked straight away with a message telling them to rejoin in a moment. Upstream holds the connection
   open instead.
-  - The message comes from the Service annotation `mc-router.itzg.me/wakeMessage`, or a built-in default.
+  - The message comes from the Service annotation `mc-router.itzg.me/wakeMessage`, or the built-in Thai default.
   - While the backend boots, the router serves the loading MOTD.
 - `mc-router.itzg.me/autoScaleUpAllowList` is a comma-separated list of player names that may wake the server, matched
   exactly.
@@ -46,7 +46,8 @@ system's dial timeout.
 ### `nethernet-router`: hostname routing for Bedrock NetherNet
 
 From BDS 1.26.50, Bedrock Dedicated Server defaults to the NetherNet transport: WebRTC, with an HTTP signaling
-handshake on TCP. From 26.60, RakNet-only servers stop being reachable by current clients. `nethernet-router` gives
+handshake on TCP. BDS 26.60 deprecates RakNet, and a 26.70 preview client measured on 2026-10-14 never fell back to
+it. `nethernet-router` gives
 NetherNet what `mc-router` gives Java: many servers behind one public IP and port, chosen by the hostname the player
 typed. Specifically, it:
 
