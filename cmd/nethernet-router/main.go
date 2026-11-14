@@ -64,6 +64,7 @@ type Config struct {
 	UnboundTtl                time.Duration `default:"60s" usage:"How long a signaled session waits for its first verified STUN check"`
 	IdleTimeout               time.Duration `default:"30s" usage:"A bound session with no client datagram for this long is dropped"`
 	HardReap                  time.Duration `default:"0s" usage:"Drop any session this old; 0 disables"`
+	RelaySockets              int           `default:"0" usage:"UDP sockets on the relay port in one SO_REUSEPORT group, each with a read loop of its own; 0 = one per core (GOMAXPROCS). More than 1 needs Linux"`
 	SignalRatePerIp           int           `default:"5" usage:"Signaling connections per second per player IP (IPv6 /64), bursting to 4x; the player's own address only, never a relay's; 0 disables"`
 	SignalRateGlobal          int           `default:"200" usage:"Signaling connections per second in all on the signal port, bursting to 2x; 0 disables"`
 	SignalRateLegacy          int           `default:"200" usage:"Signaling connections per second in all on the legacy pool ports, bursting to 2x: a bucket of their own, so a flood on a pool port never refuses a signal-port join; 0 disables"`
@@ -97,6 +98,9 @@ func (c *Config) validate() error {
 		if p < 1 || p > 65535 {
 			return fmt.Errorf("port %d is out of range", p)
 		}
+	}
+	if c.RelaySockets < 0 {
+		return fmt.Errorf("--relay-sockets must be 0 (one per core) or more, got %d", c.RelaySockets)
 	}
 	if c.LegacyPortMin > c.LegacyPortMax {
 		return fmt.Errorf("--legacy-port-min %d is above --legacy-port-max %d", c.LegacyPortMin, c.LegacyPortMax)
@@ -172,7 +176,7 @@ func run(cfg *Config) error {
 	defer stop()
 
 	// Every bind first: a port that cannot be bound is fatal at start.
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{Port: cfg.UdpPort})
+	udp, err := nethernet.ListenUDP(cfg.UdpPort, cfg.RelaySockets)
 	if err != nil {
 		return fmt.Errorf("relay UDP %d: %w", cfg.UdpPort, err)
 	}
@@ -238,10 +242,10 @@ func run(cfg *Config) error {
 	} else {
 		logrus.Info("nethernet-router: no --redis-addr; sessions are in this replica's memory only")
 	}
-	relay, err := nethernet.NewRelay(udp, nethernet.NewMemoryRegistry(), shared, nethernet.RelayOptions{
+	relay, err := nethernet.NewRelay(udp[0], nethernet.NewMemoryRegistry(), shared, nethernet.RelayOptions{
 		UnboundTTL: cfg.UnboundTtl, IdleTimeout: cfg.IdleTimeout, HardReap: cfg.HardReap,
 		MaxSessions: cfg.MaxSessions, MaxSessionsPerServer: cfg.MaxSessionsPerServer,
-		MaxPerIPPerServer: cfg.MaxSessionsPerIpPerServer, Metrics: metrics,
+		MaxPerIPPerServer: cfg.MaxSessionsPerIpPerServer, Sockets: udp[1:], Metrics: metrics,
 	})
 	if err != nil {
 		return err
@@ -285,7 +289,7 @@ func run(cfg *Config) error {
 	}
 	ready.Store(true)
 	logrus.WithFields(logrus.Fields{
-		"signal": cfg.SignalPort, "udp": cfg.UdpPort, "legacy": fmt.Sprintf("%d-%d", cfg.LegacyPortMin, cfg.LegacyPortMax),
+		"signal": cfg.SignalPort, "udp": cfg.UdpPort, "udpSockets": len(udp), "legacy": fmt.Sprintf("%d-%d", cfg.LegacyPortMin, cfg.LegacyPortMax),
 		"publicIp": cfg.PublicIp,
 	}).Info("nethernet-router: serving")
 

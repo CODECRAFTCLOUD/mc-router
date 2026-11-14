@@ -164,6 +164,102 @@ func TestRelayForwardsAfterAVerifiedBind(t *testing.T) {
 	expectReply(t, c, relayAddr, dtlsData)
 }
 
+// With an SO_REUSEPORT group, every socket is read, and a session answers
+// through the socket its client's datagrams arrive on.
+func TestRelayServesEverySocketOfItsGroup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("SO_REUSEPORT groups are Linux only here")
+	}
+	socks, err := ListenUDP(0, 2)
+	require.NoError(t, err)
+	require.Len(t, socks, 2)
+	opt := defaultOpts(nil)
+	opt.Sockets = socks[1:]
+	r, err := NewRelay(socks[0], NewMemoryRegistry(), NewMemoryRegistry(), opt)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = r.Serve(ctx); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+		for _, c := range socks {
+			_ = c.Close()
+		}
+	})
+	relayAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(socks[0].LocalAddr().(*net.UDPAddr).Port))
+
+	// Whichever socket the kernel hands each client to, its echo comes back from the relay's port.
+	used := map[*net.UDPConn]bool{}
+	for i := range 8 {
+		bds := startBDS(t)
+		pair := fmt.Sprintf("2c7%d:QXyz", i)
+		require.NoError(t, r.Register(t.Context(), pair, session(bds)))
+		c := newClient(t)
+		stunPkt := signedBinding(pair, testPwd)
+		send(t, c, relayAddr, stunPkt)
+		bds.expect(t, stunPkt)
+		expectReply(t, c, relayAddr, stunPkt)
+		r.mu.Lock()
+		used[r.byPair[pair].out] = true
+		r.mu.Unlock()
+	}
+	t.Logf("the kernel spread 8 clients over %d of 2 sockets", len(used))
+
+	// A client bound through the second socket gets its replies through it.
+	bds := startBDS(t)
+	require.NoError(t, r.Register(t.Context(), "2c79:QXyz", session(bds)))
+	c := newClient(t)
+	rs, reason := r.bind(socks[1], clientAddr(c), "2c79:QXyz", session(bds), true)
+	require.NotNil(t, rs, reason)
+	assert.Same(t, socks[1], rs.out)
+	_, err = rs.upstream.Write(dtlsData) // the stand-in BDS echoes it to the relay, which pipes it to the client
+	require.NoError(t, err)
+	bds.expect(t, dtlsData)
+	expectReply(t, c, relayAddr, dtlsData)
+}
+
+// A session replies through the socket its client's datagrams arrive on, and
+// follows the client to another socket. Two plain sockets on different ports
+// make the replying socket visible in the reply's source port; inside one
+// SO_REUSEPORT group every socket shares the port. Runs on every OS.
+func TestRelayRepliesThroughTheSocketItsClientUses(t *testing.T) {
+	a, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	b, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	opt := defaultOpts(nil)
+	opt.Sockets = []*net.UDPConn{b}
+	r, err := NewRelay(a, NewMemoryRegistry(), NewMemoryRegistry(), opt)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = r.Serve(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done; _ = a.Close(); _ = b.Close() })
+	addrA := a.LocalAddr().(*net.UDPAddr).AddrPort()
+	addrB := b.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	for i, to := range []netip.AddrPort{addrA, addrB} {
+		bds := startBDS(t)
+		pair := fmt.Sprintf("2c8%d:QXyz", i)
+		require.NoError(t, r.Register(t.Context(), pair, session(bds)))
+		c := newClient(t)
+		stunPkt := signedBinding(pair, testPwd)
+		send(t, c, to, stunPkt)
+		bds.expect(t, stunPkt)
+		expectReply(t, c, to, stunPkt) // from the socket the client used, not the relay's first
+		send(t, c, to, dtlsData)
+		bds.expect(t, dtlsData)
+		expectReply(t, c, to, dtlsData)
+
+		if i == 0 { // the same client moves to the other socket: its replies move with it
+			send(t, c, addrB, dtlsData)
+			bds.expect(t, dtlsData)
+			expectReply(t, c, addrB, dtlsData)
+		}
+	}
+}
+
 func TestRelayDropsSTUNWithABadIntegrity(t *testing.T) {
 	bds := startBDS(t)
 	m := NewMetrics(prometheus.NewRegistry())
@@ -872,7 +968,7 @@ func TestRelayReapsAnAdoptedSessionFromItsFirstSignal(t *testing.T) {
 	require.NoError(t, err)
 	s := session(bds)
 	s.CreatedAt = time.Now().UTC().Add(-opt.HardReap + 2*time.Second) // signaled elsewhere, 2 s short of HardReap
-	rs, reason := r.bind(netip.MustParseAddrPort("127.0.0.1:40000"), testPair, s, true)
+	rs, reason := r.bind(r.conn, netip.MustParseAddrPort("127.0.0.1:40000"), testPair, s, true)
 	require.NotNil(t, rs, reason)
 	r.reap(time.Now().Add(5 * time.Second))
 	assert.Nil(t, r.activeSession(testPair), "adopted session is hard-reaped from its first-signal age")
@@ -890,7 +986,7 @@ func TestRelayStampsClientTrafficOnItsMonotonicEpoch(t *testing.T) {
 	defer conn.Close()
 	r, err := NewRelay(conn, NewMemoryRegistry(), NewMemoryRegistry(), defaultOpts(nil))
 	require.NoError(t, err)
-	rs, reason := r.bind(netip.MustParseAddrPort("127.0.0.1:40000"), testPair, session(bds), true)
+	rs, reason := r.bind(r.conn, netip.MustParseAddrPort("127.0.0.1:40000"), testPair, session(bds), true)
 	require.NotNil(t, rs, reason)
 	r.queuePublish(rs)
 	r.forward(rs, dtlsData)
@@ -965,7 +1061,7 @@ func TestRelayAdoptsASessionUnderAClientLookupFlood(t *testing.T) {
 	r, err := NewRelay(conn, NewMemoryRegistry(), shared, defaultOpts(m))
 	require.NoError(t, err)
 	for i := range sharedQueue + 64 { // the read loop's view of the flood, before any worker runs
-		r.handle(t.Context(), netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(20000+i)), dtlsData)
+		r.handle(t.Context(), r.conn, netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(20000+i)), dtlsData)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -989,11 +1085,11 @@ func TestRelayCountsALookupPastItsKeyBudget(t *testing.T) {
 	require.NoError(t, err)
 	from := netip.MustParseAddrPort("192.0.2.1:20000")
 	for i := range maxLookupKeys { // no Serve: the test drains the queue itself
-		r.handle(t.Context(), from, signedBinding(fmt.Sprintf("%05d:QXyz", i), testPwd))
+		r.handle(t.Context(), r.conn, from, signedBinding(fmt.Sprintf("%05d:QXyz", i), testPwd))
 		r.sessionLookups.lookedUntil = time.Now().Add(time.Hour) // one window for the whole loop
 		<-r.sessionLookups.jobs
 	}
-	r.handle(t.Context(), from, signedBinding("extra:QXyz", testPwd))
+	r.handle(t.Context(), r.conn, from, signedBinding("extra:QXyz", testPwd))
 	assert.Equal(t, 1.0, testutil.ToFloat64(m.LookupsDropped.WithLabelValues("s")), "the key past the budget is counted")
 	assert.Equal(t, 0.0, testutil.ToFloat64(m.LookupsDropped.WithLabelValues("c")))
 }
@@ -1012,7 +1108,7 @@ func TestRelayReleasesAnAdoptedSessionWhoseDialFails(t *testing.T) {
 	r.dialUpstream = func(netip.AddrPort) (*net.UDPConn, error) { return nil, errors.New("no route") }
 	s := Session{ServerID: "srv-1", Target: netip.MustParseAddrPort("10.0.0.3:19140"), IcePwd: testPwd, CreatedAt: time.Now().UTC()}
 
-	rs, reason := r.bind(netip.MustParseAddrPort("192.0.2.1:40000"), testPair, s, true)
+	rs, reason := r.bind(r.conn, netip.MustParseAddrPort("192.0.2.1:40000"), testPair, s, true)
 	assert.Nil(t, rs)
 	assert.Equal(t, "dial_failed", reason)
 	assert.Nil(t, r.activeSession(testPair), "the adopted session is not kept")

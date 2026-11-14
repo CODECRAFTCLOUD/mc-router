@@ -1045,6 +1045,7 @@ Every flag can also be set by its `NETHERNET_<NAME>` environment variable (the p
 | `-unbound-ttl` | `NETHERNET_UNBOUND_TTL` | `60s` | How long a signaled session waits for its first verified STUN check. |
 | `-idle-timeout` | `NETHERNET_IDLE_TIMEOUT` | `30s` | A bound session with no client datagram for this long is dropped. |
 | `-hard-reap` | `NETHERNET_HARD_REAP` | `0s` | Drop any session this old. `0` disables. |
+| `-relay-sockets` | `NETHERNET_RELAY_SOCKETS` | `0` | UDP sockets on the relay port in one SO_REUSEPORT group, each with a read loop of its own; a session replies through the socket its client arrives on. `0` = one per core (GOMAXPROCS, which follows the CPU limit). More than 1 needs Linux. |
 | `-signal-rate-per-ip` | `NETHERNET_SIGNAL_RATE_PER_IP` | `5` | Signaling connections per second per player IP (IPv6 /64), bursting to 4x. Applies to the player's own address only, never to a relay's. `0` disables. |
 | `-signal-rate-global` | `NETHERNET_SIGNAL_RATE_GLOBAL` | `200` | Signaling connections per second in all on the signal port, bursting to 2x. `0` disables. |
 | `-signal-rate-legacy` | `NETHERNET_SIGNAL_RATE_LEGACY` | `200` | Signaling connections per second in all on the legacy pool ports, bursting to 2x. A bucket of their own, so a flood on a pool port never refuses a signal-port join; it can still refuse legacy joins. There is no per-IP tier there: every legacy connection arrives from the relay's address. `0` disables. |
