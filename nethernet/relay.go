@@ -50,7 +50,13 @@ var ErrInvalidSignalIP = errors.New("nethernet relay: a trusted Session.SignalIP
 type RelayOptions struct {
 	UnboundTTL, IdleTimeout, HardReap                    time.Duration
 	MaxSessions, MaxSessionsPerServer, MaxPerIPPerServer int
-	Metrics                                              *Metrics
+	// Sockets are more sockets bound to conn's port in one SO_REUSEPORT group
+	// (ListenUDP). The kernel spreads client datagrams over the group by flow;
+	// each socket gets a read loop of its own, and a session's BDS replies leave
+	// through the socket its client's datagrams arrive on. With one socket, every
+	// reply queued on its one write lock: the router ping lab's knee (2026-11-14).
+	Sockets []*net.UDPConn
+	Metrics *Metrics
 }
 
 // ipServer is the per-IP cap's key.
@@ -69,6 +75,7 @@ type relaySession struct {
 	ipKey       ipServer       // guarded by Relay.mu, with countsForIP
 	countsForIP bool           // counted in Relay.perIP
 	client      netip.AddrPort // guarded by Relay.mu
+	out         *net.UDPConn   // the socket client's datagrams arrive on, and its replies leave by; guarded by Relay.mu
 	lastSeen    atomic.Int64   // Relay.since() of the last client datagram
 	lastShared  atomic.Int64   // Relay.since() of the last shared-registry refresh; 0 = never
 
@@ -81,6 +88,7 @@ type relaySession struct {
 // password, or through a binding another replica already verified.
 type Relay struct {
 	conn          *net.UDPConn
+	socks         []*net.UDPConn // conn, then opt.Sockets: one read loop each
 	local, shared Registry
 	opt           RelayOptions
 	// epoch anchors lastSeen and lastShared: offsets on the monotonic clock, so
@@ -103,10 +111,11 @@ type Relay struct {
 	clientLookups, sessionLookups lookupBudget
 }
 
-// lookupBudget bounds one kind of shared-registry lookup. Read loop only.
+// lookupBudget bounds one kind of shared-registry lookup, across every read loop.
 type lookupBudget struct {
 	kind string // the metric label: "s" (session by STUN username) or "c" (client by address)
 	jobs chan func(context.Context)
+	mu   sync.Mutex // the read loops share the budget; only lookups take it, never a bound client's datagram
 	// Keys looked up in this window and the previous one.
 	looked, lookedPrev map[string]struct{}
 	lookedUntil        time.Time
@@ -118,7 +127,7 @@ func NewRelay(conn *net.UDPConn, local Registry, shared Registry, opt RelayOptio
 	if opt.UnboundTTL <= 0 || opt.IdleTimeout <= 0 || opt.HardReap < 0 || opt.MaxSessions <= 0 || opt.MaxSessionsPerServer <= 0 || opt.MaxPerIPPerServer <= 0 {
 		return nil, errors.New("nethernet relay: UnboundTTL, IdleTimeout, MaxSessions, MaxSessionsPerServer and MaxPerIPPerServer must be > 0, HardReap >= 0")
 	}
-	r := &Relay{conn: conn, local: local, shared: shared, opt: opt, epoch: time.Now(),
+	r := &Relay{conn: conn, socks: append([]*net.UDPConn{conn}, opt.Sockets...), local: local, shared: shared, opt: opt, epoch: time.Now(),
 		byClient: map[netip.AddrPort]*relaySession{}, byPair: map[string]*relaySession{}, perServer: map[string]int{},
 		perIP: map[ipServer]int{},
 		jobs:  make(chan func(context.Context), sharedQueue)}
@@ -175,12 +184,17 @@ func (r *Relay) Register(ctx context.Context, pair string, s Session) error {
 	return nil
 }
 
-// Serve reads the relay socket until ctx is done, then closes every upstream
+// Serve reads the relay sockets until ctx is done, then closes every upstream
 // socket. Its workers and reaper end with it, whatever the reason it returns.
+// It returns once conn's read loop does; the other sockets' loops stop with it.
 func (r *Relay) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stop := context.AfterFunc(ctx, func() { _ = r.conn.SetReadDeadline(time.Now()) })
+	stop := context.AfterFunc(ctx, func() {
+		for _, c := range r.socks {
+			_ = c.SetReadDeadline(time.Now())
+		}
+	})
 	defer stop()
 	defer r.closeAll()
 	go r.reapLoop(ctx)
@@ -188,9 +202,21 @@ func (r *Relay) Serve(ctx context.Context) error {
 		go r.work(ctx, r.jobs)
 		go r.work(ctx, r.sessionLookups.jobs)
 	}
+	var loops sync.WaitGroup
+	for _, c := range r.socks[1:] {
+		loops.Go(func() { _ = r.readLoop(ctx, c) })
+	}
+	err := r.readLoop(ctx, r.conn)
+	cancel()
+	loops.Wait() // before closeAll, so no loop binds a session it would leave open
+	return err
+}
+
+// readLoop hands every datagram on c to handle until ctx is done or c closes.
+func (r *Relay) readLoop(ctx context.Context, c *net.UDPConn) error {
 	buf := make([]byte, 64*1024)
 	for {
-		n, from, err := r.conn.ReadFromUDPAddrPort(buf)
+		n, from, err := c.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -202,11 +228,12 @@ func (r *Relay) Serve(ctx context.Context) error {
 			logrus.WithError(err).Debug("nethernet relay: read error")
 			continue
 		}
-		r.handle(ctx, netip.AddrPortFrom(from.Addr().Unmap(), from.Port()), buf[:n])
+		r.handle(ctx, c, netip.AddrPortFrom(from.Addr().Unmap(), from.Port()), buf[:n])
 	}
 }
 
-func (r *Relay) handle(ctx context.Context, from netip.AddrPort, pkt []byte) {
+// handle takes one client datagram that arrived on via.
+func (r *Relay) handle(ctx context.Context, via *net.UDPConn, from netip.AddrPort, pkt []byte) {
 	r.mu.Lock()
 	rs := r.byClient[from]
 	r.mu.Unlock()
@@ -223,13 +250,13 @@ func (r *Relay) handle(ctx context.Context, from netip.AddrPort, pkt []byte) {
 		return
 	}
 	if IsSTUN(pkt) {
-		r.bindFromSTUN(ctx, from, pkt)
+		r.bindFromSTUN(ctx, via, from, pkt)
 		return
 	}
-	r.bindFromKnownClient(ctx, from, pkt)
+	r.bindFromKnownClient(ctx, via, from, pkt)
 }
 
-func (r *Relay) bindFromSTUN(ctx context.Context, from netip.AddrPort, pkt []byte) {
+func (r *Relay) bindFromSTUN(ctx context.Context, via *net.UDPConn, from netip.AddrPort, pkt []byte) {
 	pair, ok := STUNUsername(pkt)
 	if !ok {
 		r.opt.Metrics.dropped("unknown_peer")
@@ -249,17 +276,17 @@ func (r *Relay) bindFromSTUN(ctx context.Context, from netip.AddrPort, pkt []byt
 		r.opt.Metrics.dropped("bad_integrity")
 		return
 	}
-	r.bindAndForward(from, pair, s, true, pkt)
+	r.bindAndForward(via, from, pair, s, true, pkt)
 }
 
 // bindFromKnownClient covers a failover mid-session: the client was verified on
 // another replica and its next datagram (not STUN) lands here. Only DTLS-shaped
 // datagrams (first byte 20-63, RFC 7983) are worth a shared lookup.
-func (r *Relay) bindFromKnownClient(ctx context.Context, from netip.AddrPort, pkt []byte) {
+func (r *Relay) bindFromKnownClient(ctx context.Context, via *net.UDPConn, from netip.AddrPort, pkt []byte) {
 	if pair, ok, _ := r.local.LookupClient(ctx, from); ok {
 		if s, ok := r.knownSession(ctx, pair); ok {
 			// rebind=false: a session live on this replica moves only on a verified STUN check.
-			r.bindAndForward(from, pair, s, false, pkt)
+			r.bindAndForward(via, from, pair, s, false, pkt)
 			return
 		}
 	}
@@ -283,12 +310,13 @@ func (r *Relay) knownSession(ctx context.Context, pair string) (Session, bool) {
 
 // queueLookup hands a shared-registry lookup to b's workers unless key was
 // queued in this window or the last. A lookup dropped because b's budget or
-// queue is full is counted by kind; the retransmit retries. Read loop only;
-// never blocks.
+// queue is full is counted by kind; the retransmit retries. Never blocks.
 func (r *Relay) queueLookup(b *lookupBudget, key string, job func(context.Context)) {
 	if r.shared == nil {
 		return
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if now := time.Now(); now.After(b.lookedUntil) {
 		b.lookedPrev, b.looked, b.lookedUntil = b.looked, map[string]struct{}{}, now.Add(lookupWindow)
 	}
@@ -357,8 +385,8 @@ func (r *Relay) fetchClient(ctx context.Context, client netip.AddrPort) {
 	_ = r.local.BindClient(ctx, client, pair, r.opt.UnboundTTL)
 }
 
-func (r *Relay) bindAndForward(from netip.AddrPort, pair string, s Session, rebind bool, pkt []byte) {
-	rs, reason := r.bind(from, pair, s, rebind)
+func (r *Relay) bindAndForward(via *net.UDPConn, from netip.AddrPort, pair string, s Session, rebind bool, pkt []byte) {
+	rs, reason := r.bind(via, from, pair, s, rebind)
 	if rs == nil {
 		r.opt.Metrics.dropped(reason)
 		return
@@ -367,7 +395,8 @@ func (r *Relay) bindAndForward(from netip.AddrPort, pair string, s Session, rebi
 	r.forward(rs, pkt)
 }
 
-func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool) (*relaySession, string) {
+// bind binds client, whose datagrams arrive on via, to pair's session.
+func (r *Relay) bind(via *net.UDPConn, client netip.AddrPort, pair string, s Session, rebind bool) (*relaySession, string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rs := r.byPair[pair]
@@ -376,7 +405,7 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 			return nil, "unknown_peer"
 		}
 		delete(r.byClient, rs.client)
-		rs.client = client
+		rs.client, rs.out = client, via
 		r.byClient[client] = rs
 		return rs, ""
 	}
@@ -400,7 +429,7 @@ func (r *Relay) bind(client netip.AddrPort, pair string, s Session, rebind bool)
 	}
 	rs.upstream = up
 	rs.lastSeen.Store(r.since())
-	rs.client = client
+	rs.client, rs.out = client, via
 	r.byClient[client] = rs
 	r.opt.Metrics.session(s.ServerID, "signaled", -1)
 	r.opt.Metrics.session(s.ServerID, "bound", 1)
@@ -494,7 +523,8 @@ func (r *Relay) forward(rs *relaySession, pkt []byte) {
 	}
 }
 
-// pipeUpstream sends BDS replies to whichever client address the session is bound to now.
+// pipeUpstream sends BDS replies to whichever client address the session is bound to now,
+// through the socket that client's datagrams arrive on.
 func (r *Relay) pipeUpstream(rs *relaySession) {
 	buf := make([]byte, 8*1024) // WebRTC datagrams stay near 1.2 KB
 	for {
@@ -506,9 +536,9 @@ func (r *Relay) pipeUpstream(rs *relaySession) {
 			continue
 		}
 		r.mu.Lock()
-		client := rs.client
+		client, out := rs.client, rs.out
 		r.mu.Unlock()
-		if _, err := r.conn.WriteToUDPAddrPort(buf[:n], client); err != nil {
+		if _, err := out.WriteToUDPAddrPort(buf[:n], client); err != nil {
 			logrus.WithError(err).Debug("nethernet relay: client write failed")
 		}
 	}
