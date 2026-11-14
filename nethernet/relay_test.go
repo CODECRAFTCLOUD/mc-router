@@ -219,6 +219,47 @@ func TestRelayServesEverySocketOfItsGroup(t *testing.T) {
 	expectReply(t, c, relayAddr, dtlsData)
 }
 
+// A session replies through the socket its client's datagrams arrive on, and
+// follows the client to another socket. Two plain sockets on different ports
+// make the replying socket visible in the reply's source port; inside one
+// SO_REUSEPORT group every socket shares the port. Runs on every OS.
+func TestRelayRepliesThroughTheSocketItsClientUses(t *testing.T) {
+	a, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	b, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	opt := defaultOpts(nil)
+	opt.Sockets = []*net.UDPConn{b}
+	r, err := NewRelay(a, NewMemoryRegistry(), NewMemoryRegistry(), opt)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = r.Serve(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done; _ = a.Close(); _ = b.Close() })
+	addrA := a.LocalAddr().(*net.UDPAddr).AddrPort()
+	addrB := b.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	for i, to := range []netip.AddrPort{addrA, addrB} {
+		bds := startBDS(t)
+		pair := fmt.Sprintf("2c8%d:QXyz", i)
+		require.NoError(t, r.Register(t.Context(), pair, session(bds)))
+		c := newClient(t)
+		stunPkt := signedBinding(pair, testPwd)
+		send(t, c, to, stunPkt)
+		bds.expect(t, stunPkt)
+		expectReply(t, c, to, stunPkt) // from the socket the client used, not the relay's first
+		send(t, c, to, dtlsData)
+		bds.expect(t, dtlsData)
+		expectReply(t, c, to, dtlsData)
+
+		if i == 0 { // the same client moves to the other socket: its replies move with it
+			send(t, c, addrB, dtlsData)
+			bds.expect(t, dtlsData)
+			expectReply(t, c, addrB, dtlsData)
+		}
+	}
+}
+
 func TestRelayDropsSTUNWithABadIntegrity(t *testing.T) {
 	bds := startBDS(t)
 	m := NewMetrics(prometheus.NewRegistry())

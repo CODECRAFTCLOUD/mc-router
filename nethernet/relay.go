@@ -204,7 +204,13 @@ func (r *Relay) Serve(ctx context.Context) error {
 	}
 	var loops sync.WaitGroup
 	for _, c := range r.socks[1:] {
-		loops.Go(func() { _ = r.readLoop(ctx, c) })
+		loops.Go(func() {
+			if err := r.readLoop(ctx, c); err != nil {
+				// Only a closed socket ends a loop early. Its clients' datagrams then reach
+				// the other sockets, and handle moves their replies along with them.
+				logrus.WithError(err).Error("nethernet relay: a relay socket stopped reading")
+			}
+		})
 	}
 	err := r.readLoop(ctx, r.conn)
 	cancel()
@@ -236,6 +242,11 @@ func (r *Relay) readLoop(ctx context.Context, c *net.UDPConn) error {
 func (r *Relay) handle(ctx context.Context, via *net.UDPConn, from netip.AddrPort, pkt []byte) {
 	r.mu.Lock()
 	rs := r.byClient[from]
+	if rs != nil {
+		// The kernel picks the socket by the client's flow, and moves the flow when the
+		// group changes (a socket closes): replies follow the socket it arrives on now.
+		rs.out = via
+	}
 	r.mu.Unlock()
 	if rs != nil { // DTLS records, alerts included, are never inspected
 		if IsSTUN(pkt) {

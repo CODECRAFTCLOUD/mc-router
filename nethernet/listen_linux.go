@@ -21,15 +21,18 @@ func ListenUDP(port, n int) ([]*net.UDPConn, error) {
 	if n <= 0 {
 		n = runtime.GOMAXPROCS(0)
 	}
-	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
-		var serr error
-		if err := c.Control(func(fd uintptr) {
-			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-		}); err != nil {
-			return err
+	var lc net.ListenConfig
+	if n > 1 { // one socket binds as before, so another process can never share its port
+		lc.Control = func(_, _ string, c syscall.RawConn) error {
+			var serr error
+			if err := c.Control(func(fd uintptr) {
+				serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			}); err != nil {
+				return err
+			}
+			return serr
 		}
-		return serr
-	}}
+	}
 	socks := make([]*net.UDPConn, 0, n)
 	for range n {
 		pc, err := lc.ListenPacket(context.Background(), "udp", fmt.Sprintf(":%d", port))
